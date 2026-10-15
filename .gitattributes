@@ -1,0 +1,10 @@
+# Code outside the Maru stack, which maru's line budget does not count.
+[attr]unused linguist-vendored
+viz/**            unused
+compilers/js/**   unused
+compilers/st/**   unused
+compilers/maru/maru/** unused
+runtimes/c/**     unused
+runtimes/js/**    unused
+examples/c/**     unused
+compilers/nile-process-template.c unused
