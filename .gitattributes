@@ -3,8 +3,10 @@
 viz/**            unused
 compilers/js/**   unused
 compilers/st/**   unused
-compilers/maru/maru/** unused
 runtimes/c/**     unused
 runtimes/js/**    unused
 examples/c/**     unused
 compilers/nile-process-template.c unused
+compilers/maru/nile-gen-code-c.l unused
+compilers/maru/nile-builtins-c.l unused
+compilers/maru/nile-to-c-compiler.sh unused
