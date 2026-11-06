@@ -80,3 +80,52 @@
 	  (set (. (indir v) height) height)
 	  (set (. (indir v) stride) stride)))
     (return p)))
+
+;; ReadFromImage_ARGB32, as gezira/c/gezira-image.c has it: a Texturer, each point (x, y) to the colour of the pixel it
+;; falls in, premultiplied, as Nile's Color is laid out (r, g, b, alpha), each byte over 255. A point on the right or
+;; bottom edge reads the last column or row; one outside the image reads transparent black, as the C does.
+(define-struct gezira_ReadFromImage_ARGB32_vars
+  ((pixels int *)
+   (width  int)
+   (height int)
+   (stride int)))
+
+(define-function gezira_ReadFromImage_ARGB32_body int
+  ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
+  (let* (((v struct gezira_ReadFromImage_ARGB32_vars *) (nile_Process_memory p))
+	 ((w float) (cast (. (indir v) width) float))
+	 ((h float) (cast (. (indir v) height) float))
+	 ((status int) 0))
+    (while (= status 0)
+      (while (<= (+ i 2) m)
+	(let* (((x float) (indir in i))
+	       ((y float) (indir in (+ i 1))))
+	  (set i (+ i 2))
+	  (if (= x w) (set x (- w (cast 1.0 float))))
+	  (if (= y h) (set y (- h (cast 1.0 float))))
+	  (let (((c long) (if (or (< x (cast 0.0 float)) (or (< y (cast 0.0 float)) (or (> x w) (> y h))))
+			      (cast 0 long)
+			    (gezira_unsigned (indir (. (indir v) pixels) (+ (cast x int) (* (cast y int) (. (indir v) stride))))))))
+	    (if (= j n) (nile_Process_advance_output p (addressof out) (addressof j) (addressof n)))
+	    (set (indir out j) (/ (cast (gezira_channel c (cast 65536 long)) float) (cast 255.0 float)))
+	    (set (indir out (+ j 1)) (/ (cast (gezira_channel c (cast 256 long)) float) (cast 255.0 float)))
+	    (set (indir out (+ j 2)) (/ (cast (gezira_channel c (cast 1 long)) float) (cast 255.0 float)))
+	    (set (indir out (+ j 3)) (/ (cast (gezira_channel c (cast 16777216 long)) float) (cast 255.0 float)))
+	    (set j (+ j 4)))))
+      (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m))))
+    (return (nile_Process_return p i j status))))
+
+(define-function gezira_ReadFromImage_ARGB32 (struct nile_Process *)
+  ((parent struct nile_Process *) (pixels int *) (width int) (height int) (stride int))
+  (let* (((p struct nile_Process *)
+	  (nile_Process parent 2 4 (sizeof struct gezira_ReadFromImage_ARGB32_vars)
+			(cast 0 nile_Process_work_function_t)
+			gezira_ReadFromImage_ARGB32_body
+			(cast 0 nile_Process_work_function_t))))
+    (if (!= 0 (cast p long))
+	(let (((v struct gezira_ReadFromImage_ARGB32_vars *) (nile_Process_memory p)))
+	  (set (. (indir v) pixels) pixels)
+	  (set (. (indir v) width) width)
+	  (set (. (indir v) height) height)
+	  (set (. (indir v) stride) stride)))
+    (return p)))
