@@ -2,7 +2,7 @@
 ;; "Public interface" and "The kernel interface" tables, with the C runtime's
 ;; signatures. Kernels, the runtime and its tests all compile against it.
 
-(define-struct nile_Process ())
+;; struct nile_Process is defined by the runtime (nile-thread.k), where its fields are.
 (define-type nile_Process_t struct nile_Process)
 
 (define-type nile_Process_work_function_t (int

@@ -1,15 +1,23 @@
 ;; The worker pool, as nile.c and nile-thread.h. Each worker has one mutex and
-;; one condition variable, where the C runtime has a spin lock and pauses. The
-;; liaison is the caller's thread, threads[nthreads]; threads[0] runs on it
-;; during nile_sync, and threads[1 .. nthreads-1] are OS threads.
+;; one condition variable where the C runtime has a spin lock and pauses. The
+;; liaison is the caller's thread, threads[nthreads]; the nthreads workers are
+;; OS threads, threads[0 .. nthreads-1], and the liaison runs processes itself
+;; during nile_sync and while a pour waits for its consumer.
 ;;
 ;; Typed Maru can't embed a struct by value, so every record the pool needs
-;; sits in the memory it was given, and the thread record points at its own.
-;; Processes are Task 7's: until then no process is queued, so a worker only
-;; waits. The root process is one record of its own, a block that points at
-;; the liaison; Task 7 gives nile_Process its full record.
+;; sits in the memory it was given, and a record points at the pieces it owns.
+;; The records of the pool and of a process refer to one another, so they are
+;; defined together here, ahead of the code that uses them (RFC "Data model").
 
-(load "nile.k")
+(define (BLOCK_BYTES long) 512)
+
+;; One buffer of a stream: a node, then floats from nile_Buffer_data on.
+(define-struct nile_Buffer
+  ((next     struct nile_Node *)
+   (type     int)
+   (head     int)
+   (tail     int)
+   (capacity int)))
 
 (define-struct nile_Thread
   ((lock         struct nile_Mutex *)
@@ -23,19 +31,37 @@
    (nthreads     int)
    (memory       char *)
    (nbytes       long)
+   (nblocks      int)
    (ngated       int)
+   (nlive        int)
+   (ntick        int)
+   (waiting      int)
    (status       int)))
 
-(define-struct nile_Root
-  ((next    struct nile_Node *)
-   (type    int)
-   (thread  struct nile_Thread *)
-   (nblocks int)))
+;; A process record. Its lock and input deque sit in the block after the record,
+;; and the variable record after those; see nile_Process_memory in nile-kernel.k.
+(define-struct nile_Process
+  ((next         struct nile_Node *)
+   (type         int)
+   (thread       struct nile_Thread *)
+   (lock         struct nile_Mutex *)
+   (heap         struct nile_Block *)
+   (input        struct nile_Deque *)
+   (in_quantum   int)
+   (out_quantum  int)
+   (sizeof_vars  int)
+   (prologue     nile_Process_work_function_t)
+   (body         nile_Process_work_function_t)
+   (epilogue     nile_Process_work_function_t)
+   (state        int)
+   (producer     struct nile_Process *)
+   (consumer     struct nile_Process *)
+   (gatee        struct nile_Process *)
+   (parent       struct nile_Process *)
+   (out          struct nile_Buffer *)
+   (scratch      float)))
 
 (define (dprintf (int int char * ...) *) (extern dprintf))
-
-;; BLOCK_SIZE as a long, for address arithmetic (typed Maru won't mix int and long).
-(define (BLOCK_BYTES long) 512)
 
 ;; The i-th record of size bytes from base.
 (define-function nile_offset long ((base long) (size long) (i int))
@@ -44,6 +70,10 @@
 (define-function nile_Thread_at (struct nile_Thread *) ((threads struct nile_Thread *) (i int))
   (return (cast (nile_offset (cast threads long) (cast (sizeof struct nile_Thread) long) i)
 		struct nile_Thread *)))
+
+;; The liaison is the record after the workers'.
+(define-function nile_Thread_liaison (struct nile_Thread *) ((t struct nile_Thread *))
+  (return (nile_Thread_at (. (indir t) threads) (. (indir t) nthreads))))
 
 (define-function nile_Thread_init void
   ((t struct nile_Thread *) (index int) (threads struct nile_Thread *) (nthreads int)
@@ -66,23 +96,20 @@
   (set (. (indir t) nthreads) nthreads)
   (set (. (indir t) memory) memory)
   (set (. (indir t) nbytes) nbytes)
+  (set (. (indir t) nblocks) 0)
   (set (. (indir t) ngated) 0)
+  (set (. (indir t) nlive) 0)
+  (set (. (indir t) ntick) 0)
+  (set (. (indir t) waiting) 0)
   (set (. (indir t) status) NILE_STATUS_OK))
 
-;; The thread a process is active on: the liaison, for the root.
-(define-function nile_Process_thread (struct nile_Thread *) ((p struct nile_Process *))
-  (return (. (indir (cast p struct nile_Root *)) thread)))
-
-;; The worker's thread body. Task 7 runs queued processes here; until then
-;; it waits on its condition variable until it has work or is shut down.
-(define-function nile_Thread_main (void *) ((arg void *))
-  (let (((t struct nile_Thread *) (cast arg struct nile_Thread *)))
+;; The thread's status, read under its lock.
+(define-function nile_Thread_status_of int ((t struct nile_Thread *))
+  (let (((s int) 0))
     (nile_lock (. (indir t) lock))
-    (while (and (= (. (indir t) status) NILE_STATUS_OK)
-		(= 0 (. (indir (. (indir t) q)) n)))
-      (nile_wait (. (indir t) wake) (. (indir t) lock)))
+    (set s (. (indir t) status))
     (nile_unlock (. (indir t) lock))
-    (return (cast 0 void *))))
+    (return s)))
 
 ;; Takes the head chunk off t's public heap under t's lock; 0 when it has none.
 (define-function nile_Thread_pop_public_chunk (struct nile_Block *) ((t struct nile_Thread *))
@@ -92,7 +119,8 @@
     (return c)))
 
 ;; The i-th victim of t's steal order, as nile.c's nile_Thread_steal: victims
-;; alternate above and below t's index, with the liaison last (i = nthreads).
+;; alternate above and below t's index, so i = 1 .. nthreads covers every worker
+;; and, for the liaison, worker 0 as well.
 (define-function nile_Thread_victim (struct nile_Thread *) ((t struct nile_Thread *) (i int))
   (let ((j (+ (. (indir t) index) (. (indir t) nthreads)))
 	(k 1))
@@ -109,12 +137,11 @@
 (define-function nile_Thread_steal_chunk (struct nile_Block *) ((t struct nile_Thread *))
   (let (((c struct nile_Block *) (cast 0 struct nile_Block *))
 	(i 1))
-    (while (and (= 0 (cast c long)) (< i (. (indir t) nthreads)))
+    (while (and (= 0 (cast c long)) (<= i (. (indir t) nthreads)))
       (set c (nile_Thread_pop_public_chunk (nile_Thread_victim t i)))
       (set i (+ i 1)))
     (if (= 0 (cast c long))
-	(set c (nile_Thread_pop_public_chunk
-		(nile_Thread_at (. (indir t) threads) (. (indir t) nthreads)))))
+	(set c (nile_Thread_pop_public_chunk (nile_Thread_liaison t))))
     (return c)))
 
 ;; A chunk for t's allocator: its own public heap first, then a steal. When
@@ -139,9 +166,142 @@
   (nile_Heap_push_chunk (addressof (. (indir t) public_heap)) c)
   (nile_unlock (. (indir t) lock)))
 
+;; ---------------------------------------------------------------- queues
+
+;; Pops the head of victim's queue under its lock; 0 when it is empty.
+(define-function nile_Thread_steal_from_q (struct nile_Node *) ((v struct nile_Thread *))
+  (let (((nd struct nile_Node *) (cast 0 struct nile_Node *)))
+    (nile_lock (. (indir v) lock))
+    (set nd (nile_Deque_pop_head (. (indir v) q)))
+    (nile_unlock (. (indir v) lock))
+    (return nd)))
+
+;; Pops the tail of t's own queue under its lock; 0 when it is empty.
+(define-function nile_Thread_pop_own (struct nile_Node *) ((t struct nile_Thread *))
+  (let (((nd struct nile_Node *) (cast 0 struct nile_Node *)))
+    (nile_lock (. (indir t) lock))
+    (set nd (nile_Deque_pop_tail (. (indir t) q)))
+    (nile_unlock (. (indir t) lock))
+    (return nd)))
+
+;; Takes one process from another worker, in steal order, then from the liaison.
+(define-function nile_Thread_steal_process (struct nile_Node *) ((t struct nile_Thread *))
+  (let (((nd struct nile_Node *) (cast 0 struct nile_Node *))
+	(i 1))
+    (while (and (= 0 (cast nd long)) (<= i (. (indir t) nthreads)))
+      (set nd (nile_Thread_steal_from_q (nile_Thread_victim t i)))
+      (set i (+ i 1)))
+    (if (= 0 (cast nd long))
+	(set nd (nile_Thread_steal_from_q (nile_Thread_liaison t))))
+    (return nd)))
+
+;; Wakes one worker that is waiting for work, if any, after a push.
+(define-function nile_Thread_wake_one void ((t struct nile_Thread *))
+  (let ((i 0)
+	(done 0)
+	(n (. (indir t) nthreads)))
+    (while (and (= done 0) (< i n))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(nile_lock (. (indir o) lock))
+	(if (. (indir o) waiting)
+	    (let ()
+	      (nile_signal (. (indir o) wake))
+	      (set done 1)))
+	(nile_unlock (. (indir o) lock)))
+      (set i (+ i 1)))))
+
+;; Queues nd on t, counting it live on the liaison first, so the count never
+;; reads zero while work is on its way; then wakes t, or another waiting worker.
+(define-function nile_Thread_append_to_q void ((t struct nile_Thread *) (nd struct nile_Node *))
+  (let (((l struct nile_Thread *) (nile_Thread_liaison t)))
+    (nile_lock (. (indir l) lock))
+    (set (. (indir l) nlive) (+ (. (indir l) nlive) 1))
+    (nile_unlock (. (indir l) lock)))
+  (nile_lock (. (indir t) lock))
+  (nile_Deque_push_tail (. (indir t) q) nd)
+  (if (. (indir t) waiting)
+      (nile_signal (. (indir t) wake)))
+  (nile_unlock (. (indir t) lock))
+  (nile_Thread_wake_one t))
+
+;; A queued process has finished its run: the liaison's live count drops, and
+;; the liaison wakes when nothing is live.
+(define-function nile_Thread_finished void ((t struct nile_Thread *))
+  (let (((l struct nile_Thread *) (nile_Thread_liaison t)))
+    (nile_lock (. (indir l) lock))
+    (set (. (indir l) nlive) (- (. (indir l) nlive) 1))
+    (if (and (= 0 (. (indir l) nlive)) (. (indir l) waiting))
+	(nile_signal (. (indir l) wake)))
+    (nile_unlock (. (indir l) lock))))
+
+;; A gated pipeline has finished: the liaison's gate count drops.
+(define-function nile_Thread_gate_done void ((t struct nile_Thread *))
+  (let (((l struct nile_Thread *) (nile_Thread_liaison t)))
+    (nile_lock (. (indir l) lock))
+    (set (. (indir l) ngated) (- (. (indir l) ngated) 1))
+    (if (and (= 0 (. (indir l) ngated)) (. (indir l) waiting))
+	(nile_signal (. (indir l) wake)))
+    (nile_unlock (. (indir l) lock))))
+
+;; Something the liaison may be waiting for has changed: its tick moves, and
+;; it wakes if it is waiting.
+(define-function nile_Thread_poke void ((l struct nile_Thread *))
+  (nile_lock (. (indir l) lock))
+  (set (. (indir l) ntick) (+ (. (indir l) ntick) 1))
+  (if (. (indir l) waiting)
+      (nile_signal (. (indir l) wake)))
+  (nile_unlock (. (indir l) lock)))
+
+;; Waits for work or shutdown: an idle worker sleeps on its condition variable,
+;; checking its queue under the lock first so a push can't be missed.
+(define-function nile_Thread_idle void ((t struct nile_Thread *))
+  (nile_lock (. (indir t) lock))
+  (while (and (= 0 (. (indir (. (indir t) q)) n))
+	      (!= NILE_STATUS_SHUTTING_DOWN (. (indir t) status)))
+    (set (. (indir t) waiting) 1)
+    (nile_wait (. (indir t) wake) (. (indir t) lock))
+    (set (. (indir t) waiting) 0))
+  (nile_unlock (. (indir t) lock)))
+
+;; The liaison waits until its tick moves from seen; a poke after the read
+;; of seen is never missed, because both happen under the liaison's lock.
+(define-function nile_Thread_sleep_from void ((l struct nile_Thread *) (seen int))
+  (nile_lock (. (indir l) lock))
+  (if (= seen (. (indir l) ntick))
+      (let ()
+	(set (. (indir l) waiting) 1)
+	(nile_wait (. (indir l) wake) (. (indir l) lock))
+	(set (. (indir l) waiting) 0)))
+  (nile_unlock (. (indir l) lock)))
+
+;; Runs nd, then the rest of t's own queue, until it is empty or t is shut down.
+(define-function nile_Thread_work void ((t struct nile_Thread *) (nd struct nile_Node *))
+  (while (!= 0 (cast nd long))
+    (nile_Process_run (cast nd struct nile_Process *) t)
+    (nile_Thread_finished t)
+    (if (= NILE_STATUS_SHUTTING_DOWN (nile_Thread_status_of t))
+	(set nd (cast 0 struct nile_Node *))
+	(set nd (nile_Thread_pop_own t)))))
+
+;; The worker's thread body: run its own queue, steal when it is empty, and
+;; wait when there is nothing to steal either, until shut down.
+(define-function nile_Thread_main (void *) ((arg void *))
+  (let (((t struct nile_Thread *) (cast arg struct nile_Thread *))
+	((nd struct nile_Node *) (cast 0 struct nile_Node *)))
+    (while (!= NILE_STATUS_SHUTTING_DOWN (nile_Thread_status_of t))
+      (set nd (nile_Thread_pop_own t))
+      (if (= 0 (cast nd long))
+	  (set nd (nile_Thread_steal_process t)))
+      (if (= 0 (cast nd long))
+	  (nile_Thread_idle t)
+	  (nile_Thread_work t nd)))
+    (return (cast 0 void *))))
+
+;; ---------------------------------------------------------------- runtime calls
+
 ;; Starts a runtime in memory: the thread records, their locks, conditions,
-;; queues and OS thread handles, then the root block, then blocks dealt
-;; round-robin to the threads' public heaps. Returns 0 when memory can't hold
+;; queues and OS thread handles, then the root process's block, then blocks dealt
+;; round-robin to the workers' public heaps. Returns 0 when memory can't hold
 ;; the records, the root block and a chunk per worker.
 (define-function nile_startup (struct nile_Process *) ((memory char *) (nbytes int) (nthreads int))
   (let (((m long) (cast memory long))
@@ -165,7 +325,7 @@
 	   (+ (- blocks_at m) (* (cast nthreads long) (* (cast CHUNK_MAX_LEN long) BLOCK_BYTES))))
 	(return (cast 0 struct nile_Process *)))
     (let (((threads struct nile_Thread *) (cast start struct nile_Thread *))
-	  ((root struct nile_Root *) (cast root_at struct nile_Root *))
+	  ((root struct nile_Process *) (cast root_at struct nile_Process *))
 	  ((end long) (+ m (cast nbytes long)))
 	  ((block long) blocks_at)
 	  ((nblocks int) 0)
@@ -181,52 +341,66 @@
 			  (cast (nile_offset (+ start off_os) (cast (sizeof struct nile_OSThread) long) i)
 				struct nile_OSThread *))
 	(set i (+ i 1)))
-      (set (. (indir root) next) (cast 0 struct nile_Node *))
-      (set (. (indir root) type) 1)
-      (set (. (indir root) thread) (nile_Thread_at threads nthreads))
+      (nile_Process_setup root root 1 1 0 (cast 0 nile_Process_work_function_t)
+			  (cast 0 nile_Process_work_function_t) (cast 0 nile_Process_work_function_t))
       (set i 0)
       (while (<= (+ block BLOCK_BYTES) end)
-	(nile_Heap_push (addressof (. (indir (nile_Thread_at threads (+ 1 (% i nthreads)))) public_heap))
+	(nile_Heap_push (addressof (. (indir (nile_Thread_at threads (% i nthreads))) public_heap))
 			(cast block struct nile_Block *))
 	(set block (+ block BLOCK_BYTES))
 	(set nblocks (+ nblocks 1))
 	(set i (+ i 1)))
-      (set (. (indir root) nblocks) nblocks)
-      (set i 1)
+      (set i 0)
+      (while (<= i nthreads)
+	(set (. (indir (nile_Thread_at threads i)) nblocks) nblocks)
+	(set i (+ i 1)))
+      (nile_Process_activate root (nile_Thread_at threads nthreads))
+      (set i 0)
       (while (< i nthreads)
 	(let (((t struct nile_Thread *) (nile_Thread_at threads i)))
 	  (pthread_create (. (indir t) osthread) (cast 0 void *)
 			  (cast nile_Thread_main void *) (cast t void *)))
 	(set i (+ i 1)))
-      (return (cast root struct nile_Process *)))))
+      (return root))))
 
 ;; Returns the status the liaison's thread holds.
 (define-function nile_status int ((p struct nile_Process *))
-  (let (((t struct nile_Thread *) (nile_Process_thread p))
-	((s int) 0))
-    (nile_lock (. (indir t) lock))
-    (set s (. (indir t) status))
-    (nile_unlock (. (indir t) lock))
-    (return s)))
+  (return (nile_Thread_status_of (nile_Process_thread p))))
 
 (define-function nile_error int ((p struct nile_Process *))
   (return (!= NILE_STATUS_OK (nile_status p))))
 
-;; Waits until no pipeline is gated on the liaison. Nothing gates in Task 6,
-;; so this returns at once; Task 7 signals the condition when a gate clears.
+;; Runs queued processes, the liaison's own and any it can steal, until nothing
+;; is live, then returns once no pipeline is gated; it also returns when the
+;; runtime has an error, since the processes stop on their own then.
 (define-function nile_sync void ((p struct nile_Process *))
-  (let (((t struct nile_Thread *) (nile_Process_thread p)))
-    (nile_lock (. (indir t) lock))
-    (while (!= 0 (. (indir t) ngated))
-      (nile_wait (. (indir t) wake) (. (indir t) lock)))
-    (nile_unlock (. (indir t) lock))))
+  (let (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((done int) 0)
+	((nd struct nile_Node *) (cast 0 struct nile_Node *)))
+    (while (= done 0)
+      (set nd (nile_Thread_pop_own t))
+      (if (= 0 (cast nd long))
+	  (set nd (nile_Thread_steal_process t)))
+      (if (!= 0 (cast nd long))
+	  (nile_Thread_work t nd)
+	  (let ()
+	    (nile_lock (. (indir t) lock))
+	    (if (or (!= NILE_STATUS_OK (. (indir t) status))
+		    (and (= 0 (. (indir t) nlive)) (= 0 (. (indir t) ngated))))
+		(set done 1)
+		(let ()
+		  (set (. (indir t) waiting) 1)
+		  (nile_wait (. (indir t) wake) (. (indir t) lock))
+		  (set (. (indir t) waiting) 0)))
+	    (nile_unlock (. (indir t) lock)))))
+    (nile_Process_activate p t)))
 
 ;; Stops every worker, wakes each one under its own lock, joins the OS threads,
 ;; and returns the memory the runtime was started in.
 (define-function nile_shutdown (char *) ((p struct nile_Process *))
-  (let (((t struct nile_Thread *) (nile_Process_thread p))
-	((n int) (. (indir (nile_Process_thread p)) nthreads))
-	(i 0))
+  (let* (((t struct nile_Thread *) (nile_Process_deactivate p))
+	 ((n int) (. (indir t) nthreads))
+	 (i 0))
     (while (<= i n)
       (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
 	(nile_lock (. (indir o) lock))
@@ -234,7 +408,7 @@
 	(nile_broadcast (. (indir o) wake))
 	(nile_unlock (. (indir o) lock)))
       (set i (+ i 1)))
-    (set i 1)
+    (set i 0)
     (while (< i n)
       (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
 	(pthread_join (. (indir (. (indir o) osthread)) w0) (cast 0 void *)))
@@ -251,10 +425,11 @@
     (return n)))
 
 ;; Reports to stderr when the blocks in the heaps aren't all the blocks the
-;; runtime carved, as nile.c's nile_print_leaks does.
+;; runtime carved, as nile.c's nile_print_leaks does. The root's heap counts
+;; too, so the root is deactivated while the count runs.
 (define-function nile_print_leaks void ((p struct nile_Process *))
-  (let (((t struct nile_Thread *) (nile_Process_thread p))
-	((nblocks int) (. (indir (cast p struct nile_Root *)) nblocks))
+  (let* (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((nblocks int) (. (indir t) nblocks))
 	((n int) 0)
 	(i 0))
     (while (<= i (. (indir t) nthreads))
@@ -265,7 +440,8 @@
 	(nile_unlock (. (indir o) lock)))
       (set i (+ i 1)))
     (if (!= n nblocks)
-	(dprintf 2 "# blocks not in a heap: %d\n" (- nblocks n)))))
+	(dprintf 2 "# blocks not in a heap: %d\n" (- nblocks n)))
+    (nile_Process_activate p t)))
 
 ;; The public calls are external symbols, so a kernel or driver reaches them through
 ;; nile.k's externs (dlsym) and not only through this file's own references.
