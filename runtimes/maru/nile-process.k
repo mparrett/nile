@@ -82,7 +82,7 @@
   (set (. (indir p) gatee) (cast 0 struct nile_Process *))
   (set (. (indir p) parent) parent)
   (set (. (indir p) out) (cast 0 struct nile_Buffer *))
-  (set (. (indir p) scratch) (cast 0.0 float)))
+  (set (. (indir p) scratch0) (cast 0.0 float)))
 
 (define-function nile_Process_thread (struct nile_Thread *) ((p struct nile_Process *))
   (return (. (indir p) thread)))

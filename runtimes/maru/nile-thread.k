@@ -11,6 +11,9 @@
 
 (define (BLOCK_BYTES long) 512)
 
+;; The floats in a process's scratch area: what a kernel writes, and reads back, when no block is free (nile-kernel.k).
+(define (SCRATCH_FLOATS int) 16)
+
 ;; One buffer of a stream: a node, then floats from nile_Buffer_data on.
 (define-struct nile_Buffer
   ((next     struct nile_Node *)
@@ -60,7 +63,23 @@
    (gatee        struct nile_Process *)
    (parent       struct nile_Process *)
    (out          struct nile_Buffer *)
-   (scratch      float)))
+   ;; SCRATCH_FLOATS floats the kernel writes when no block is free (nile_Process_scratch): contiguous, last in the record.
+   (scratch0 float)
+   (scratch1 float)
+   (scratch2 float)
+   (scratch3 float)
+   (scratch4 float)
+   (scratch5 float)
+   (scratch6 float)
+   (scratch7 float)
+   (scratch8 float)
+   (scratch9 float)
+   (scratch10 float)
+   (scratch11 float)
+   (scratch12 float)
+   (scratch13 float)
+   (scratch14 float)
+   (scratch15 float)))
 
 (define (dprintf (int int char * ...) *) (extern dprintf))
 

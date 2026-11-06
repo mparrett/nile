@@ -78,14 +78,20 @@
 ;; free the output goes to a scratch float that the runtime discards, and the
 ;; next advance_input stops the kernel. Never fails, as the kernel calls it
 ;; mid-statement.
+;; The scratch area of p's record: SCRATCH_FLOATS floats the kernel may write, and the runtime discards, when no block is free.
+;; The record holds them contiguously, last, so nothing after them is written by a kernel that stays within them.
+(define-function nile_Process_scratch (float *) ((p struct nile_Process *))
+  (return (addressof (. (indir p) scratch0))))
+
 (define-function nile_Process_advance_output void
   ((p struct nile_Process *) (out float * *) (j int *) (n int *))
   (let (((cur struct nile_Buffer *) (. (indir p) out)))
     (if (= 0 (cast cur long))
 	(let ()
-	  (set (indir out) (addressof (. (indir p) scratch)))
+	  (nile_Process_fail p NILE_STATUS_OUT_OF_MEMORY)
+	  (set (indir out) (nile_Process_scratch p))
 	  (set (indir j) 0)
-	  (set (indir n) 1))
+	  (set (indir n) SCRATCH_FLOATS))
 	(let (((nb struct nile_Buffer *) (cast 0 struct nile_Buffer *)))
 	  (set (. (indir cur) tail) (indir j))
 	  (set (. (indir p) out) (cast 0 struct nile_Buffer *))
@@ -93,9 +99,10 @@
 	  (set nb (nile_Buffer p))
 	  (if (= 0 (cast nb long))
 	      (let ()
-		(set (indir out) (addressof (. (indir p) scratch)))
+		(nile_Process_fail p NILE_STATUS_OUT_OF_MEMORY)
+		(set (indir out) (nile_Process_scratch p))
 		(set (indir j) 0)
-		(set (indir n) 1))
+		(set (indir n) SCRATCH_FLOATS))
 	      (let ()
 		(set (. (indir p) out) nb)
 		(set (indir out) (nile_Buffer_data nb))
@@ -122,9 +129,10 @@
   (let (((b struct nile_Buffer *) (nile_Buffer p)))
     (if (= 0 (cast b long))
 	(let ()
-	  (set (indir in) (addressof (. (indir p) scratch)))
-	  (set (indir i) 1)
-	  (set (indir m) 1))
+	  (nile_Process_fail p NILE_STATUS_OUT_OF_MEMORY)
+	  (set (indir in) (nile_Process_scratch p))
+	  (set (indir i) SCRATCH_FLOATS)
+	  (set (indir m) SCRATCH_FLOATS))
 	(let ()
 	  (set (. (indir b) head) (. (indir b) capacity))
 	  (set (. (indir b) tail) (. (indir b) capacity))
