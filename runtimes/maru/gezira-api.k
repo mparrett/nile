@@ -60,13 +60,7 @@
     (nile_sync i)
     (return (nile_error i))))
 
-;; ir-gen-c sets the runtime's extern pointers and every global's initial value inside main. The Makefile
-;; renames that main to gezira_init_globals in the library's C and adds a constructor that calls it when the
-;; library is loaded; the main here is never run, and returns 0.
-(define-function main int ((argc int) (argv char * *))
-  (return 0))
-
-;; the entry points, kept in the library: a unit's functions not reached from main are dropped
+;; the entry points, kept in the library: a unit's functions are kept only when exported
 (export gezira_start)
 (export gezira_stop)
 (export gezira_image_new)
