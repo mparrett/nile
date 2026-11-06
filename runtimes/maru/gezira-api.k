@@ -42,9 +42,13 @@
 ;; Fills one path: params holds the matrix (a b c d e f, x' = a x + c y + e) and the uniform paint
 ;; (alpha red green blue); floats holds count floats, quadratic Béziers six to a path element, in the
 ;; image's own coordinates before the matrix. The path is clipped to width x height, which is the
-;; image's size. Returns the runtime's error status (0 for none).
+;; image's size. Returns the runtime's error status (0 for none). A count that isn't a whole number of
+;; elements is refused with BAD_ARG, as nile_Process_feed refuses it: the trailing floats would stay in
+;; the pipeline, and the kernels' push-back past their buffer's start then writes outside it.
 (define-function gezira_fill int
   ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int))
+  (if (!= 0 (% count 6))
+      (return NILE_STATUS_BAD_ARG))
   (let* (((i nile_Process_t *) (cast init nile_Process_t *))
 	 ((out nile_Process_t *) (gezira_WriteToImage_ARGB32 i (cast pixels int *) width height width))
 	 ((paint nile_Process_t *) (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6)))
