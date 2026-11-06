@@ -8,7 +8,8 @@
 ;;   words, breaks, points: the integers in are glyph pairs (width, style) of text-layout.nl's Glyph; words
 ;;       prints MakeWords' Word triples (width, style, glyphs), breaks InsertLineBreaks' output of them, and
 ;;       points LayoutText's points (x, y), each as integers, one per line.
-;; A failed run prints nothing and exits 1 (the runtime's error, or no start).
+;; A failed run prints nothing and exits 1 (the runtime's error, no start, or no memory); a missing or unknown mode, or a
+;; worker count outside 1 to 64, exits 2.
 
 (define (printf (int char * ...) *) (extern printf))
 (define (scanf (int char * ...) *) (extern scanf))
@@ -16,6 +17,7 @@
 (define (free (void void *) *) (extern free))
 (define (atoi (int char *) *) (extern atoi))
 (define (strcmp (int char * char *) *) (extern strcmp))
+(define (exit (void int) *) (extern exit))
 
 (define (NBYTES_PER_THREAD int) 1000000)
 (define (NIN int) 65536)
@@ -54,21 +56,46 @@
 	(set p (nile_Process_pipe (text_layout_MakeWords init (cast w float)) p)))
     (return (nile_Process_pipe (nile_Funnel init) p))))
 
+(define (MAX_THREADS int) 64)	; NBYTES_PER_THREAD times it still fits nile_startup's int
+
+(define-function known_mode int ((mode char *))
+  (let (((known int) 0))
+    (if (= 0 (strcmp mode "pass")) (set known 1))
+    (if (= 0 (strcmp mode "reverse")) (set known 1))
+    (if (= 0 (strcmp mode "sort")) (set known 1))
+    (if (= 0 (strcmp mode "dupcat")) (set known 1))
+    (if (= 0 (strcmp mode "dupzip")) (set known 1))
+    (if (= 0 (strcmp mode "words")) (set known 1))
+    (if (= 0 (strcmp mode "breaks")) (set known 1))
+    (if (= 0 (strcmp mode "points")) (set known 1))
+    (return known)))
+
+;; a missing or unknown mode, or a worker count outside 1 to MAX_THREADS, exits 2; memory that can't be had, 1.  Through exit:
+;; ir-gen-c.k's C main drops f_main's result and returns 0
 (define-function main int ((argc int) (argv char * *))
-  (let* (((nthreads int) (if (> argc 1) (atoi (indir argv 1)) 1))
+  (if (< argc 3)
+      (exit 2))
+  (let* (((nthreads int) (atoi (indir argv 1)))
 	 ((mode char *) (indir argv 2))
 	 ((w int) (if (> argc 3) (atoi (indir argv 3)) 10))
-	 ((nbytes int) (* NBYTES_PER_THREAD nthreads))
-	 ((mem char *) (malloc (cast nbytes long)))
-	 ((init nile_Process_t *) (nile_startup mem nbytes nthreads))
+	 ((nbytes int) 0)
+	 ((mem char *) 0)
+	 ((init nile_Process_t *) 0)
 	 ((data float *) (malloc (cast (* NIN 4) long)))
 	 ((out float *) (malloc (cast (* NOUT 4) long)))
 	 ((count int) 0)
 	 ((n int) 0)
 	 ((failed int) 0)
 	 (k 0))
+    (if (or (< nthreads 1) (> nthreads MAX_THREADS) (= 0 (known_mode mode)))
+	(exit 2))
+    (set nbytes (* NBYTES_PER_THREAD nthreads))
+    (set mem (malloc (cast nbytes long)))
+    (if (or (= 0 (cast mem long)) (= 0 (cast data long)) (= 0 (cast out long)))
+	(exit 1))
+    (set init (nile_startup mem nbytes nthreads))
     (if (= 0 (cast init long))
-	(return 1))
+	(exit 1))
     (set n (read_input data NIN))
     (nile_Funnel_pour (build_mode init mode w out (addressof count)) data n 1)
     (nile_sync init)
@@ -81,4 +108,5 @@
     (free (nile_shutdown init))
     (free data)
     (free out)
+    (exit failed)
     (return failed)))
