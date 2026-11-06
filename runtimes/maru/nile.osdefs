@@ -1,0 +1,10 @@
+// The pthread types the Nile runtime sizes its opaque structs from (nile-sync.k).
+// Read from pthread.h on the build machine, as system.osdefs is (R-opaque-pthread).
+
+header	pthread.h
+
+type	mutex	pthread_mutex_t
+type	cond	pthread_cond_t
+type	thread	pthread_t
+
+sizes	mutex cond thread
