@@ -34,14 +34,11 @@
 (define-function is_white int ((px int))
   (return (= (unsigned_pixel px) (- (* (cast 65536 long) (cast 65536 long)) (cast 1 long)))))
 
-;; A half-covered edge pixel: opaque, red, and green and blue between 0 and 255.
+;; A half-covered edge pixel, as gezira-image.c's blend has it for coverage 0.5 over white: coverage byte
+;; 128, inverse 127, so red stays 255 and green and blue fall to 127 (ideal 127.5): 0xFFFF7F7F
+;; (4294934399 = 65535 * 65536 + 32639).
 (define-function is_half_edge int ((px int))
-  (let* (((u long) (unsigned_pixel px))
-	 ((g long) (channel u (cast 256 long)))
-	 ((b long) (channel u (cast 1 long))))
-    (return (and (= 255 (channel u (cast 16777216 long)))
-		 (and (= 255 (channel u (cast 65536 long)))
-		      (and (= g b) (and (< 0 g) (< g 255))))))))
+  (return (= (unsigned_pixel px) (+ (* (cast 65535 long) (cast 65536 long)) (cast 32639 long)))))
 
 ;; Funnel into the rectangle's kernels into WriteToImage_ARGB32 over the pixels; the sub-processes
 ;; are built with the parent active, as build_dup does.
