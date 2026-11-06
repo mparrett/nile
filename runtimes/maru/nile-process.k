@@ -37,6 +37,22 @@
   (set (. (indir d) tail) (cast 0 struct nile_Node *))
   (set (. (indir d) n) 0))
 
+;; A process with no body passes its input through, then is removed (the RFC's "missing body"). A
+;; process's body is never 0 until swap or a reroute sets it so, which marks it for removal;
+;; without this default, a process with only a prologue would be removed before the prologue ran.
+(define-function nile_Process_default_body int
+  ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
+  (let ((status 0))
+    (while (= status 0)
+      (while (< i m)
+	(if (= j n)
+	    (nile_Process_advance_output p (addressof out) (addressof j) (addressof n)))
+	(set (indir out j) (indir in i))
+	(set j (+ j 1))
+	(set i (+ i 1)))
+      (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m))))
+    (return (nile_Process_return p i j status))))
+
 ;; Fills in a process record in its block. The work functions may be 0.
 (define-function nile_Process_setup void
   ((p struct nile_Process *) (parent struct nile_Process *)
@@ -56,6 +72,8 @@
   (set (. (indir p) out_quantum) out_quantum)
   (set (. (indir p) sizeof_vars) sizeof_vars)
   (set (. (indir p) prologue) prologue)
+  (if (= 0 (cast body long))
+      (set body nile_Process_default_body))
   (set (. (indir p) body) body)
   (set (. (indir p) epilogue) epilogue)
   (set (. (indir p) state) NILE_BLOCKED_ON_PRODUCER)
@@ -370,7 +388,9 @@
 		    (nile_Process_epilogue p t)
 		    (set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap)))))))))
 
-;; Runs p's epilogue on its own output once its input is gone, then removes it.
+;; Runs p's epilogue on its own output once its input is gone, then removes it. An
+;; epilogue that waits for another process (Cat, Zip) deactivates p itself and sets handed,
+;; and p is left there.
 (define-function nile_Process_epilogue void ((p struct nile_Process *) (t struct nile_Thread *))
   (nile_Process_activate p t)
   (let (((out struct nile_Buffer *) (nile_Buffer p)))
@@ -378,13 +398,15 @@
 	(nile_Process_deactivate p)
 	(let ()
 	  (set (. (indir p) out) out)
+	  (set (. (indir t) handed) 0)
 	  ((. (indir p) epilogue) p (cast 0 float *) 0 0
 	   (nile_Buffer_data out) (. (indir out) tail) (nile_Process_limit p))
-	  (if (!= NILE_STATUS_OK (nile_Thread_status_of t))
-	      (nile_Process_deactivate p)
-	      (let ((t2 (nile_Process_deactivate p)))
-		(set (. (indir t2) private_heap)
-		     (nile_Process_remove p t2 (. (indir t2) private_heap)))))))))
+	  (if (= 0 (. (indir t) handed))
+	      (if (!= NILE_STATUS_OK (nile_Thread_status_of t))
+		  (nile_Process_deactivate p)
+		  (let ((t2 (nile_Process_deactivate p)))
+		    (set (. (indir t2) private_heap)
+			 (nile_Process_remove p t2 (. (indir t2) private_heap))))))))))
 
 ;; The last process of the chain that starts at p. The chain is private to the caller until it's joined.
 (define-function nile_Process_chain_end (struct nile_Process *) ((p struct nile_Process *))
@@ -433,7 +455,8 @@
 	  (nile_Process_handle_backpressure p)
 	  (nile_Process_handle_out_of_input p))))
 
-;; Calls p's work function on its head input buffer and its current output buffer.
+;; Calls p's work function on its head input buffer and its current output buffer. A
+;; prologue or body that reroutes p has handed it on (handed is set), and then p is left alone.
 (define-function nile_Process_work void ((p struct nile_Process *) (t struct nile_Thread *))
   (let (((in float *) (cast 0 float *))
 	((i int) 0)
@@ -444,26 +467,27 @@
 	  (set in (nile_Buffer_data head))
 	  (set i (. (indir head) head))
 	  (set m (. (indir head) tail))))
+    (set (. (indir t) handed) 0)
     (if (!= 0 (cast (. (indir p) prologue) long))
 	(let ()
 	  ((. (indir p) prologue) p (cast 0 float *) 0 0
 	   (nile_Buffer_data (. (indir p) out)) (. (indir (. (indir p) out)) tail) (nile_Process_limit p))
 	  (set (. (indir p) prologue) (cast 0 nile_Process_work_function_t))))
-    (if (!= NILE_STATUS_OK (nile_Thread_status_of t))
-	(nile_Process_deactivate p)
-	(if (= 0 (cast (. (indir p) body) long))
-	    (let ((t2 (nile_Process_deactivate p)))
-	      (set (. (indir t2) private_heap)
-		   (nile_Process_remove p t2 (. (indir t2) private_heap))))
-	    (let ()
-	      (nile_Process_set_state p NILE_NOT_BLOCKED)
-	      (set (. (indir t) handed) 0)
-	      ((. (indir p) body) p in i m
-	       (nile_Buffer_data (. (indir p) out)) (. (indir (. (indir p) out)) tail) (nile_Process_limit p))
-	      ;; A reroute has already deactivated p and handed it on; p is no longer ours to
-	      ;; look at (it may be reused once removed).
-	      (if (= 0 (. (indir t) handed))
-		  (nile_Process_after_work p t)))))))
+    (if (= 0 (. (indir t) handed))
+	(if (!= NILE_STATUS_OK (nile_Thread_status_of t))
+	    (nile_Process_deactivate p)
+	    (if (= 0 (cast (. (indir p) body) long))
+		(let ((t2 (nile_Process_deactivate p)))
+		  (set (. (indir t2) private_heap)
+		       (nile_Process_remove p t2 (. (indir t2) private_heap))))
+		(let ()
+		  (nile_Process_set_state p NILE_NOT_BLOCKED)
+		  ((. (indir p) body) p in i m
+		   (nile_Buffer_data (. (indir p) out)) (. (indir (. (indir p) out)) tail) (nile_Process_limit p))
+		  ;; A reroute has already deactivated p and handed it on; p is no longer ours to
+		  ;; look at (it may be reused once removed).
+		  (if (= 0 (. (indir t) handed))
+		      (nile_Process_after_work p t))))))))
 
 ;; Runs p on thread t until it blocks, is removed, or hands its output on.
 (define-function nile_Process_run void ((p struct nile_Process *) (t struct nile_Thread *))

@@ -20,6 +20,7 @@
     (if (= 0 (cast nd long))
 	(return (cast 0 struct nile_Buffer *)))
     (let (((b struct nile_Buffer *) (cast nd struct nile_Buffer *)))
+      (set (. (indir b) next) (cast 0 struct nile_Node *))
       (set (. (indir b) type) NILE_BUFFER_TYPE)
       (set (. (indir b) head) 0)
       (set (. (indir b) tail) 0)
