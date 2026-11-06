@@ -358,7 +358,7 @@
 	(let () (set fuller p2) (set other p1)))
     (nile_Process_set_producer other other)
     (nile_Process_join p fuller)
-    (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+    (nile_Process_stop_for_consumer p)
     (return 1)))
 
 (define-function nile_Dup_body int
@@ -686,7 +686,7 @@
 	  (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m)))))
     ;; the consumer is at quota, or the runtime stopped us there: it waits on this zipper, and the
     ;; sibling no longer feeds it, as C's quota handling does.
-    (if (or (= stop 1) (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of p)))
+    (if (or (= stop 1) (. (indir (. (indir p) thread)) stopped))
 	(let ((c (nile_Process_consumer_of p)))
 	  (if (!= 0 (cast c long))
 	      (let ()
@@ -696,7 +696,7 @@
 	  (nile_lock (. (indir (. (indir v) sibling)) lock))
 	  (set (. (indir (. (indir v) sibling)) consumer) (cast 0 struct nile_Process *))
 	  (nile_unlock (. (indir (. (indir v) sibling)) lock))
-	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)))
+	  (nile_Process_stop_for_consumer p)))
     (return (nile_Process_return p i j NILE_STATUS_OK))))
 
 ;; The second zipper to finish hands on the shared buffer that is still being filled, with its
