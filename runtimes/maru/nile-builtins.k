@@ -294,53 +294,97 @@
 	  (set (. (indir v) head) (cast 0 struct nile_Buffer *))))
     (return p)))
 
-;; Dup: copies its input to two branches. The first branch is its consumer, and it gets
-;; the buffers Dup writes to its output; the second gets copies in buffers of its own,
-;; pushed to its input as each one fills. Dup's epilogue hands the last copies to the second
-;; branch and makes it Dup's consumer, so the second branch runs once Dup has finished.
+;; Dup: copies its input to two branches, as C's nile_Dup_body does. Each branch gets its own copy of every
+;; element, written in step into a buffer of its own (q1, q2), and each full pair is pushed to the branches' inputs.
+;; The consumer is the branch that Dup's back-pressure follows. After each push Dup checks both branches' quotas:
+;; when one is at quota, the fuller branch becomes its consumer, the other becomes its own producer (it runs on its
+;; own input), and Dup stops in BLOCKED_ON_CONSUMER, so the kernel schedules the consumer. Dup's epilogue pushes the
+;; last copies, releases the first branch from its producer, and makes the second its consumer, as C's does.
 (define-struct nile_Dup_vars
   ((p1 struct nile_Process *)       ; the head of the first branch
    (p2 struct nile_Process *)       ; the head of the second branch
-   (q2 struct nile_Buffer *)))      ; the copies for the second branch being filled
+   (q1 struct nile_Buffer *)        ; the copies for the first branch being filled, 0 when none
+   (q2 struct nile_Buffer *)))      ; the copies for the second branch being filled, 0 when none
 
-;; Pushes the buffer of copies to the second branch's input, under its lock; an empty one is freed.
-(define-function nile_Dup_push2 void ((p nile_Process_t *) (v struct nile_Dup_vars *))
-  (let (((b struct nile_Buffer *) (. (indir v) q2))
-	((p2 struct nile_Process *) (. (indir v) p2)))
+;; Makes pr the producer of c, under c's lock.
+(define-function nile_Process_set_producer void ((c struct nile_Process *) (pr struct nile_Process *))
+  (nile_lock (. (indir c) lock))
+  (set (. (indir c) producer) pr)
+  (nile_unlock (. (indir c) lock)))
+
+;; Pushes the copies b to branch c's input, under its lock; an empty buffer is freed.
+(define-function nile_Dup_push void ((p nile_Process_t *) (c struct nile_Process *) (b struct nile_Buffer *))
+  (if (= (. (indir b) head) (. (indir b) tail))
+      (nile_Process_free_node p (cast b struct nile_Node *))
+      (let ()
+	(nile_lock (. (indir c) lock))
+	(nile_Deque_push_tail (. (indir c) input) (cast b struct nile_Node *))
+	(nile_unlock (. (indir c) lock)))))
+
+;; Gives the branches a copy buffer each, unless they have them; 0 when no block is free.
+(define-function nile_Dup_open int ((p nile_Process_t *) (v struct nile_Dup_vars *))
+  (if (!= 0 (cast (. (indir v) q1) long))
+      (return 1))
+  (let (((b1 struct nile_Buffer *) (nile_Buffer p)))
+    (if (= 0 (cast b1 long))
+	(return 0))
+    (let (((b2 struct nile_Buffer *) (nile_Buffer p)))
+      (if (= 0 (cast b2 long))
+	  (let ()
+	    (nile_Process_free_node p (cast b1 struct nile_Node *))
+	    (return 0)))
+      (set (. (indir v) q1) b1)
+      (set (. (indir v) q2) b2)
+      (return 1))))
+
+;; Pushes the full pair of copy buffers, one to each branch, and then checks the quotas. When one branch is at
+;; quota the fuller becomes Dup's consumer and the other runs on its own input: its producer is itself, as C's
+;; nile_Dup_body has it. Dup then stops in BLOCKED_ON_CONSUMER (1), and the kernel schedules the consumer.
+(define-function nile_Dup_full int ((p nile_Process_t *) (v struct nile_Dup_vars *))
+  (let (((b1 struct nile_Buffer *) (. (indir v) q1))
+	((b2 struct nile_Buffer *) (. (indir v) q2))
+	((p1 struct nile_Process *) (. (indir v) p1))
+	((p2 struct nile_Process *) (. (indir v) p2))
+	((fuller struct nile_Process *) (cast 0 struct nile_Process *))
+	((other struct nile_Process *) (cast 0 struct nile_Process *)))
+    (set (. (indir v) q1) (cast 0 struct nile_Buffer *))
     (set (. (indir v) q2) (cast 0 struct nile_Buffer *))
-    (if (= (. (indir b) head) (. (indir b) tail))
-	(nile_Process_free_node p (cast b struct nile_Node *))
-	(let ()
-	  (nile_lock (. (indir p2) lock))
-	  (nile_Deque_push_tail (. (indir p2) input) (cast b struct nile_Node *))
-	  (nile_unlock (. (indir p2) lock))))))
+    (nile_Dup_push p p1 b1)
+    (nile_Dup_push p p2 b2)
+    (if (and (= 0 (nile_Process_quota_hit p1)) (= 0 (nile_Process_quota_hit p2)))
+	(return 0))
+    (if (> (nile_Process_input_n p1) (nile_Process_input_n p2))
+	(let () (set fuller p1) (set other p2))
+	(let () (set fuller p2) (set other p1)))
+    (nile_Process_set_producer other other)
+    (nile_Process_join p fuller)
+    (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+    (return 1)))
 
 (define-function nile_Dup_body int
   ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
   (let (((v struct nile_Dup_vars *) (nile_Process_memory p))
-	((limit int) (nile_Process_limit p))
-	((status int) 0))
-    (while (= status 0)
-      (while (< i m)
-	(if (= j n)
-	    (nile_Process_advance_output p (addressof out) (addressof j) (addressof n)))
-	(set (indir out j) (indir in i))
-	(set j (+ j 1))
-	(if (or (= 0 (cast (. (indir v) q2) long)) (= limit (. (indir (. (indir v) q2)) tail)))
-	    (let ()
-	      (if (!= 0 (cast (. (indir v) q2) long))
-		  (nile_Dup_push2 p v))
-	      (let ((b (nile_Buffer p)))
-		(if (= 0 (cast b long))
-		    (return (nile_Process_return p i j NILE_STATUS_OUT_OF_MEMORY)))
-		(set (. (indir v) q2) b))))
-	(let ((b (. (indir v) q2)))
-	  (set (indir (nile_Buffer_data b) (. (indir b) tail)) (indir in i))
-	  (set (. (indir b) tail) (+ (. (indir b) tail) 1)))
-	(set i (+ i 1)))
-      (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m))))
+	((status int) 0)
+	((stop int) 0))
+    (while (and (= status 0) (= stop 0))
+      (while (and (< i m) (= stop 0))
+	(if (= 0 (nile_Dup_open p v))
+	    (return (nile_Process_return p i j NILE_STATUS_OUT_OF_MEMORY)))
+	(let (((b1 struct nile_Buffer *) (. (indir v) q1))
+	      ((b2 struct nile_Buffer *) (. (indir v) q2)))
+	  (set (indir (nile_Buffer_data b1) (. (indir b1) tail)) (indir in i))
+	  (set (indir (nile_Buffer_data b2) (. (indir b2) tail)) (indir in i))
+	  (set (. (indir b1) tail) (+ (. (indir b1) tail) 1))
+	  (set (. (indir b2) tail) (+ (. (indir b2) tail) 1))
+	  (set i (+ i 1))
+	  (if (= (. (indir b1) tail) (nile_Process_limit p))
+	      (set stop (nile_Dup_full p v)))))
+      (if (= stop 0)
+	  (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m)))))
     (return (nile_Process_return p i j status))))
 
+;; The last copies go to their branches. The first branch loses its producer, so it finishes when its input
+;; does, and is scheduled if it is waiting; the second becomes Dup's consumer, and Dup is removed behind it.
 (define-function nile_Dup_epilogue int
   ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
   (let* (((v struct nile_Dup_vars *) (nile_Process_memory p))
@@ -348,20 +392,21 @@
 	 ((p1 struct nile_Process *) (. (indir v) p1))
 	 ((p2 struct nile_Process *) (. (indir v) p2))
 	 ((st int) 0))
-    (if (!= 0 (cast (. (indir v) q2) long))
-	(nile_Dup_push2 p v))
+    (nile_Process_flush p)
+    (if (!= 0 (cast (. (indir v) q1) long))
+	(let (((b1 struct nile_Buffer *) (. (indir v) q1))
+	      ((b2 struct nile_Buffer *) (. (indir v) q2)))
+	  (set (. (indir v) q1) (cast 0 struct nile_Buffer *))
+	  (set (. (indir v) q2) (cast 0 struct nile_Buffer *))
+	  (nile_Dup_push p p1 b1)
+	  (nile_Dup_push p p2 b2)))
     (nile_lock (. (indir p1) lock))
     (set (. (indir p1) producer) (cast 0 struct nile_Process *))
     (set st (. (indir p1) state))
     (nile_unlock (. (indir p1) lock))
     (if (= st NILE_BLOCKED_ON_PRODUCER)
 	(nile_Process_schedule_on p1 t))
-    (nile_lock (. (indir p) lock))
-    (set (. (indir p) consumer) p2)
-    (nile_unlock (. (indir p) lock))
-    (nile_lock (. (indir p2) lock))
-    (set (. (indir p2) producer) p)
-    (nile_unlock (. (indir p2) lock))
+    (nile_Process_join p p2)
     (return NILE_STATUS_OK)))
 
 (define-function nile_Dup (struct nile_Process *)
@@ -375,6 +420,7 @@
 	(let (((v struct nile_Dup_vars *) (nile_Process_memory p)))
 	  (set (. (indir v) p1) p1)
 	  (set (. (indir v) p2) p2)
+	  (set (. (indir v) q1) (cast 0 struct nile_Buffer *))
 	  (set (. (indir v) q2) (cast 0 struct nile_Buffer *))
 	  (set (. (indir p) consumer) p1)
 	  (set (. (indir p1) producer) p)))

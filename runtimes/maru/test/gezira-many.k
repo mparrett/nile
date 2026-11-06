@@ -1,0 +1,77 @@
+;; gezira_many: many fills through the Gezira library's entry points (gezira-api.k), each to a fresh
+;; pipeline, as gezira-maru.l makes them. The fills mix three shapes: a 40 by 30 rectangle, a 540 by 620
+;; one (a whole KSWorld page's first path is that size, and rasterizing it outgrew the runtime's heap when
+;; DupZip buffered its second branch) and a 200 by 100 one below it. argv[1] is the worker count, one by
+;; default. Prints "gezira many ok" when every fill returns 0, the big rectangle's interior is opaque red,
+;; the page outside is white, and nile_print_leaks reports nothing on stderr (check gezira_many compares
+;; the line and the empty stderr).
+
+(define (printf (int char * ...) *) (extern printf))
+(define (malloc (void * long) *) (extern malloc))
+(define (free (void void *) *) (extern free))
+(define (atoi (int char *) *) (extern atoi))
+
+(define (WIDTH int) 1024)
+(define (HEIGHT int) 768)
+(define (NFILLS int) 1200)
+
+;; One straight side per float run of six: the rectangle's four sides, each start, start, end.
+(define-function put_rect void ((data float *) (x0 float) (y0 float) (x1 float) (y1 float))
+  (let ()
+    (set (indir data 0) x0)  (set (indir data 1) y0)  (set (indir data 2) x0)  (set (indir data 3) y0)
+    (set (indir data 4) x1)  (set (indir data 5) y0)  (set (indir data 6) x1)  (set (indir data 7) y0)
+    (set (indir data 8) x1)  (set (indir data 9) y0)  (set (indir data 10) x1) (set (indir data 11) y1)
+    (set (indir data 12) x1) (set (indir data 13) y1) (set (indir data 14) x1) (set (indir data 15) y1)
+    (set (indir data 16) x0) (set (indir data 17) y1) (set (indir data 18) x0) (set (indir data 19) y1)
+    (set (indir data 20) x0) (set (indir data 21) y1) (set (indir data 22) x0) (set (indir data 23) y0)))
+
+;; The matrix (identity, translated by (e, f)) and the paint (alpha red green blue), as entry point's params.
+(define-function put_params void ((params float *) (e float) (f float) (alpha float) (red float) (green float) (blue float))
+  (set (indir params 0) (cast 1.0 float)) (set (indir params 1) (cast 0.0 float))
+  (set (indir params 2) (cast 0.0 float)) (set (indir params 3) (cast 1.0 float))
+  (set (indir params 4) e)               (set (indir params 5) f)
+  (set (indir params 6) alpha)           (set (indir params 7) red)
+  (set (indir params 8) green)           (set (indir params 9) blue))
+
+(define-function main int ((argc int) (argv char * *))
+  (let* (((nthreads int) (if (> argc 1) (atoi (indir argv 1)) 1))
+	 ((init long) (gezira_start nthreads))
+	 ((pixels long) (gezira_image_new WIDTH HEIGHT))
+	 ((data float *) (malloc (cast (* 24 4) long)))
+	 ((params float *) (malloc (cast (* 10 4) long)))
+	 ((failed int) 0)
+	 ((k int) 0))
+    (if (= 0 init)
+	(return 1))
+    (gezira_image_clear pixels WIDTH HEIGHT -1)
+    (while (and (= failed 0) (< k NFILLS))
+      (if (= 0 (% k 3))
+	  (let ()
+	    (put_rect data (cast 0.0 float) (cast 0.0 float) (cast 40.0 float) (cast 30.0 float))
+	    (put_params params (cast (% (* k 7) 500) float) (cast 20.0 float)
+			(cast 1.0 float) (cast 0.0 float) (cast 0.0 float) (cast 1.0 float)))
+	  (if (= 1 (% k 3))
+	      (let ()
+		(put_rect data (cast 0.0 float) (cast 0.0 float) (cast 540.0 float) (cast 620.0 float))
+		(put_params params (cast 10.0 float) (cast 10.0 float)
+			    (cast 1.0 float) (cast 1.0 float) (cast 0.0 float) (cast 0.0 float)))
+	      (let ()
+		(put_rect data (cast 0.0 float) (cast 0.0 float) (cast 200.0 float) (cast 100.0 float))
+		(put_params params (cast (% (* k 13) 600) float) (cast 650.0 float)
+			    (cast 1.0 float) (cast 0.0 float) (cast 1.0 float) (cast 0.0 float)))))
+      (if (!= 0 (gezira_fill init pixels WIDTH HEIGHT params data 24))
+	  (set failed 1))
+      (set k (+ k 1)))
+    (if (= failed 0)
+	(if (or (!= (gezira_pixel pixels WIDTH 100 100) -65536)
+		(!= (gezira_pixel pixels WIDTH 1000 700) -1))
+	    (set failed 1)))
+    (nile_print_leaks (cast init nile_Process_t *))
+    (gezira_stop init)
+    (gezira_image_free pixels)
+    (free data)
+    (free params)
+    (if (= failed 0)
+	(printf "gezira many ok\n")
+	(printf "gezira many FAILED after %d fills\n" k))
+    (return failed)))
