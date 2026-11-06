@@ -77,20 +77,36 @@
 
 ; A built-in process takes the output quantum of each process argument after it
 ; (the runtime's DupZip(parent, q, p1, p1_out, p2, p2_out)); other arguments are values.
-(define-function nile-builtin-arg-vals (args env)
+; SortBy's index is a 1-based field number in Nile (as the JS compiler's nile-builtin.js
+; has it) and the runtime's is a 0-based offset, so the value is converted here.
+(define-function nile-builtin-value (full-name vals)
+  (if (= full-name "nile_SortBy")
+    (list (++ (++ "(- (cast (cast " (car vals)) " int32) int) 1)"))
+    vals))
+
+(define-method process-type? <nile-processtype> () 1)
+(define-method process-type? <nile-typedef>     () (process-type? self.type))
+(define-method process-type? <nile-primtype>    () ())
+(define-method process-type? <nile-tupletype>   () ())
+(define-method process-type? <nile-recordtype>  () ())
+
+(define-function nile-builtin-arg-vals (full-name args env)
   (if (pair? args)
     (let* ((arg   (car args))
            (vals  (flatten (gen-code arg env)))
-           (outq  (if (is-a? (type arg) <nile-processtype>)
+           (outq  (if (process-type? (type arg))
                     (list (csize (outtype (type arg))))
-                    ())))
-      (concat-list (concat-list vals outq) (nile-builtin-arg-vals (cdr args) env)))))
+                    ()))
+           (args_ (if (process-type? (type arg))
+                    vals
+                    (nile-builtin-value full-name vals))))
+      (concat-list (concat-list args_ outq) (nile-builtin-arg-vals full-name (cdr args) env)))))
 
 (define-method gen-code <nile-processinst> (env)
   (let* ((prefix     (if (empty? self.process) "nile" (module-name env)))
          (full-name  (++ (++ prefix "_") (name self.process)))
          (arg-vals   (if (empty? self.process)
-                       (nile-builtin-arg-vals self.args env)
+                       (nile-builtin-arg-vals full-name self.args env)
                        (flatten (map-with gen-code self.args env))))
          (iquantum   (csize (intype (type self))))
          (arg-vals_  (if (empty? self.process) (cons iquantum arg-vals) arg-vals))
