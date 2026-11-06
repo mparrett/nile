@@ -112,5 +112,39 @@
 	(set (. (indir (. (indir p) out)) tail) j))
     (return (nile_Thread_status_of (. (indir p) thread)))))
 
+;; Pushes back at a buffer's start (Nile's <<): a new empty buffer goes in front of the
+;; current one, and in, i and m are set to its end, so the kernel writes downward from
+;; there. With no block free the kernel gets the scratch float (one slot, discarded), and
+;; the next advance_input stops it on the error the failed allocation has set.
+(define-function nile_Process_prefix_input void
+  ((p struct nile_Process *) (in float * *) (i int *) (m int *))
+  (let (((b struct nile_Buffer *) (nile_Buffer p)))
+    (if (= 0 (cast b long))
+	(let ()
+	  (set (indir in) (addressof (. (indir p) scratch)))
+	  (set (indir i) 1)
+	  (set (indir m) 1))
+	(let ()
+	  (set (. (indir b) head) (. (indir b) capacity))
+	  (set (. (indir b) tail) (. (indir b) capacity))
+	  (nile_lock (. (indir p) lock))
+	  (nile_Deque_push_head (. (indir p) input) (cast b struct nile_Node *))
+	  (nile_unlock (. (indir p) lock))
+	  (set (indir in) (nile_Buffer_data b))
+	  (set (indir i) (. (indir b) capacity))
+	  (set (indir m) (. (indir b) capacity))))))
+
+;; Saves the kernel's positions, i in the input buffer and j in the output, then places the
+;; pipeline sub between p and its consumer (nile_Process_swap). Returns the thread's status.
+(define-function nile_Process_reroute int
+  ((p struct nile_Process *) (i int) (j int) (sub struct nile_Process *))
+  (let (((head struct nile_Buffer *) (nile_Process_head p)))
+    (if (!= 0 (cast head long))
+	(set (. (indir head) head) i))
+    (if (!= 0 (cast (. (indir p) out) long))
+	(set (. (indir (. (indir p) out)) tail) j))
+    (return (nile_Process_swap p sub))))
+
 (export nile_Process nile_Process_memory nile_Process_advance_output
-	nile_Process_advance_input nile_Process_return)
+	nile_Process_advance_input nile_Process_prefix_input nile_Process_return
+	nile_Process_reroute)

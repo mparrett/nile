@@ -386,6 +386,43 @@
 		(set (. (indir t2) private_heap)
 		     (nile_Process_remove p t2 (. (indir t2) private_heap)))))))))
 
+;; The last process of the chain that starts at p. The chain is private to the caller until it's joined.
+(define-function nile_Process_chain_end (struct nile_Process *) ((p struct nile_Process *))
+  (let ((q p))
+    (while (!= 0 (cast (. (indir q) consumer) long))
+      (set q (. (indir q) consumer)))
+    (return q)))
+
+;; Makes b the consumer of a: a's output goes to b's input. Each end is written under its own lock.
+(define-function nile_Process_join void ((a struct nile_Process *) (b struct nile_Process *))
+  (nile_lock (. (indir a) lock))
+  (set (. (indir a) consumer) b)
+  (nile_unlock (. (indir a) lock))
+  (nile_lock (. (indir b) lock))
+  (set (. (indir b) producer) a)
+  (nile_unlock (. (indir b) lock)))
+
+;; Places sub between p and p's consumer, as C's nile_Process_swap, for a kernel that has
+;; saved its positions (nile_Process_reroute). p's output so far goes to its old consumer,
+;; which deactivate flushes before the relink; the rest of p's input goes to sub, and sub's
+;; output to the old consumer. p's body is cleared, so it is removed now, or by its
+;; producer's schedule when it has to wait on that producer. Returns the thread's status.
+(define-function nile_Process_swap int ((p struct nile_Process *) (sub struct nile_Process *))
+  (let (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((c struct nile_Process *) (nile_Process_consumer_of p)))
+    (set (. (indir t) handed) 1)
+    (if (!= 0 (cast sub long))
+	(let ()
+	  (if (!= 0 (cast c long))
+	      (nile_Process_join (nile_Process_chain_end sub) c))
+	  (nile_Process_join p sub)))
+    (nile_lock (. (indir p) lock))
+    (set (. (indir p) body) (cast 0 nile_Process_work_function_t))
+    (nile_unlock (. (indir p) lock))
+    (if (= 0 (nile_Process_block_on_producer p))
+	(set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap))))
+    (return (nile_Thread_status_of t))))
+
 ;; After the kernel returns: an error ends the run; otherwise quota or running
 ;; out of input decides what happens next.
 (define-function nile_Process_after_work void ((p struct nile_Process *) (t struct nile_Thread *))
@@ -420,9 +457,13 @@
 		   (nile_Process_remove p t2 (. (indir t2) private_heap))))
 	    (let ()
 	      (nile_Process_set_state p NILE_NOT_BLOCKED)
+	      (set (. (indir t) handed) 0)
 	      ((. (indir p) body) p in i m
 	       (nile_Buffer_data (. (indir p) out)) (. (indir (. (indir p) out)) tail) (nile_Process_limit p))
-	      (nile_Process_after_work p t))))))
+	      ;; A reroute has already deactivated p and handed it on; p is no longer ours to
+	      ;; look at (it may be reused once removed).
+	      (if (= 0 (. (indir t) handed))
+		  (nile_Process_after_work p t)))))))
 
 ;; Runs p on thread t until it blocks, is removed, or hands its output on.
 (define-function nile_Process_run void ((p struct nile_Process *) (t struct nile_Thread *))

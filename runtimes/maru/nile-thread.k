@@ -36,7 +36,8 @@
    (nlive        int)
    (ntick        int)
    (waiting      int)
-   (status       int)))
+   (status       int)
+   (handed       int)))   ; 1 when the running process rerouted itself: its work function stops there
 
 ;; A process record. Its lock and input deque sit in the block after the record,
 ;; and the variable record after those; see nile_Process_memory in nile-kernel.k.
@@ -101,6 +102,7 @@
   (set (. (indir t) nlive) 0)
   (set (. (indir t) ntick) 0)
   (set (. (indir t) waiting) 0)
+  (set (. (indir t) handed) 0)
   (set (. (indir t) status) NILE_STATUS_OK))
 
 ;; The thread's status, read under its lock.
