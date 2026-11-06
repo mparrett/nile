@@ -669,9 +669,12 @@
     (set first (. (indir sv) alive))
     (set (. (indir v) alive) 0)
     (nile_unlock (. (indir shared) lock))
+    ;; Deactivate first, as C's nile_Zip_epilogue does: the process's heap goes to its thread whichever zipper
+    ;; finished first, and the second activates for its own pair. Activating a process that still holds its heap
+    ;; (the second zipper, which never deactivated) overwrote that heap and dropped its blocks.
+    (nile_Process_deactivate p)
     (if (= 1 first)
 	(let ()
-	  (nile_Process_deactivate p)
 	  (set (. (indir t) handed) 1)
 	  (return NILE_STATUS_OK)))
     (nile_Process_activate p t)
