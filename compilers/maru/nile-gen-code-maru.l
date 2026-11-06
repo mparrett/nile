@@ -37,18 +37,70 @@
   (let ((pipeline-var (gen-code self.pipeline env)))
     (out env "(return (nile_Process_reroute p i j "pipeline-var"))\n")))
 
+; An if's branches each bind their own primed values. After the if, each primed
+; value is copied into fresh variables: the branch's when the condition holds,
+; else the other branch's. A branch that doesn't set it keeps the unprimed value.
+(define-function nile-binding-named (bindings wanted)
+  (if bindings
+    (if (= wanted (name (car (car bindings))))
+      (cdr (car bindings))
+      (nile-binding-named (cdr bindings) wanted))))
+
+(define-function nile-entry-named (bindings wanted)
+  (if bindings
+    (if (= wanted (name (car (car bindings))))
+      (car bindings)
+      (nile-entry-named (cdr bindings) wanted))))
+
+(define-function nile-cvar-type-in (cvs cvar)
+  (if cvs
+    (if (= cvar (car (car cvs)))
+      (cdr (car cvs))
+      (nile-cvar-type-in (cdr cvs) cvar))))
+
+; Shapes match: then, else and ref (the unprimed value) hold the same cvars' layout. A list
+; merges element by element (its cdr is a list too, so the walk is the same call); a leaf is a cvar.
+(define-function nile-merge-cvals (env cval then-cvals else-cvals ref-cvals)
+  (if (pair? then-cvals)
+    (cons (nile-merge-cvals env cval (car then-cvals) (car else-cvals) (car ref-cvals))
+          (nile-merge-cvals env cval (cdr then-cvals) (cdr else-cvals) (cdr ref-cvals)))
+    (if then-cvals
+      (let ((merged (alloc-cvar env (nile-cvar-type-in (cvars env) ref-cvals))))
+        (out env "(set "merged" (if "cval" "then-cvals" "else-cvals"))\n")
+        merged))))
+
+(define-function nile-unique-names (names)
+  (let ((out ()))
+    (list-do n names (or (member? n out) (push out n)))
+    (list-reverse! out)))
+
+(define-function nile-merge-primed (env cval before then-b else-b)
+  (let ((entries (filter (lambda (b) (is-primed? (car b))) (concat-list then-b else-b))))
+    (list-do pname (nile-unique-names (map (lambda (b) (name (car b))) entries))
+      (let* ((vardecl (car (nile-entry-named entries pname)))
+             (ref     (nile-binding-named before (unprimed-name vardecl)))
+             (then-c  (or (nile-binding-named then-b pname) ref))
+             (else-c  (or (nile-binding-named else-b pname) ref)))
+        (bind env vardecl (nile-merge-cvals env cval then-c else-c ref))))))
+
 (define-method gen-code <nile-ifstmt> (env)
-  (let ((cval (car (gen-code self.condition env))))
+  (let* ((cval   (car (gen-code self.condition env)))
+         (before (bindings env)))
     (out env "(if "cval"\n")
     (push-indent env)
       (out env "(let ()\n")
       (push-indent env) (gen-code self.tblock env) (pop-indent env)
       (out env ")\n")
-      (out env "(let ()\n")
-      (push-indent env) (gen-code self.fblock env) (pop-indent env)
-      (out env ")\n")
-    (pop-indent env)
-    (out env ")\n")))
+      (let ((then-b (bindings env)))
+        (set-bindings env before)
+        (out env "(let ()\n")
+        (push-indent env) (gen-code self.fblock env) (pop-indent env)
+        (out env ")\n")
+        (let ((else-b (bindings env)))
+          (pop-indent env)
+          (out env ")\n")
+          (set-bindings env before)
+          (nile-merge-primed env cval before then-b else-b)))))
 
 (define-method gen-code <nile-instmt> (env)
   (list-do value self.values

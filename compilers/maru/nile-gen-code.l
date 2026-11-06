@@ -75,10 +75,23 @@
 (define-method gen-code <nile-processref> (env)
   (car (lookup env (name self.var))))
 
+; A built-in process takes the output quantum of each process argument after it
+; (the runtime's DupZip(parent, q, p1, p1_out, p2, p2_out)); other arguments are values.
+(define-function nile-builtin-arg-vals (args env)
+  (if (pair? args)
+    (let* ((arg   (car args))
+           (vals  (flatten (gen-code arg env)))
+           (outq  (if (is-a? (type arg) <nile-processtype>)
+                    (list (csize (outtype (type arg))))
+                    ())))
+      (concat-list (concat-list vals outq) (nile-builtin-arg-vals (cdr args) env)))))
+
 (define-method gen-code <nile-processinst> (env)
   (let* ((prefix     (if (empty? self.process) "nile" (module-name env)))
          (full-name  (++ (++ prefix "_") (name self.process)))
-         (arg-vals   (flatten (map-with gen-code self.args env)))
+         (arg-vals   (if (empty? self.process)
+                       (nile-builtin-arg-vals self.args env)
+                       (flatten (map-with gen-code self.args env))))
          (iquantum   (csize (intype (type self))))
          (arg-vals_  (if (empty? self.process) (cons iquantum arg-vals) arg-vals))
          (result-var (car (alloc-cvars (type self) env))))
