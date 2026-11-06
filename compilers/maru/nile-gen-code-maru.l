@@ -96,6 +96,17 @@
     (pop-indent env)
     (out env "))\n\n")))
 
+; The size of the variable struct gen-code-for-vars-struct writes, or 0 when
+; the kernel has no variables. The constructor is written before the
+; variables are allocated, so this counts them the way the struct does.
+(define-method vars-sizeof <nile-processdef> (cname env)
+  (let* ((_vardecls (++ (params self.sig) (vardecls self.prologue)))
+         (env_      (clone env (string-port)))
+         (_         (map-with gen-code _vardecls env_)))
+    (if (cvars env_)
+      (++ (++ "(sizeof struct " cname) "_vars)")
+      "0")))
+
 (define-method gen-code-for-constructor <nile-processdef> (cname env)
   (out env "(define-function "cname" (nile_Process_t *) (\n")
   (push-indent env)
@@ -106,6 +117,7 @@
     (out-no-indent env ")\n\n")
     (out env "(let* (((p nile_Process_t *) (nile_Process parent "
              (csize (intype (type self)))" "(csize (outtype (type self)))" "
+             (vars-sizeof self cname env)" "
              (if (empty? self.prologue) "0 " (++ cname "_prologue "))
              (if (not self.body)        "0 " (++ cname "_body "))
              (if (empty? self.epilogue) "0"  (++ cname "_epilogue"))"))\n")
