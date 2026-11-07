@@ -96,6 +96,8 @@
   (pthread_cond_init (addressof nile_sched_wake) (cast 0 void *))
   (set nile_sched_seed seed)
   (set nile_sched_steps 0)
+  (set nile_sched_handoffs 0)
+  (set nile_sched_fixed (cast 0 long *))
   (set nile_sched_nchanges NILE_CHANGES)
   (let (((i int) 0))
     (while (< i NILE_CHANGES)
@@ -253,6 +255,11 @@
 	(if (= got 0)
 	    (pthread_mutex_lock m)))
       (pthread_mutex_lock m)))
+
+;; Takes m if it is free and answers 1, or answers 0 at once: a lock taken out of order can't wait, so it can't make a cycle.
+(define-function nile_trylock int ((m struct nile_Mutex *))
+  (if nile_sched_on (nile_sched_yield))
+  (return (= 0 (pthread_mutex_trylock m))))
 
 (define-function nile_unlock void ((m struct nile_Mutex *))
   (pthread_mutex_unlock m)

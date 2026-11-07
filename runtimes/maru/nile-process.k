@@ -4,8 +4,10 @@
 ;; buffer it writes; the kernel calls the interface in nile-kernel.k.
 ;;
 ;; A process runs on one thread at a time. Its input deque and state are read
-;; by its producer and consumer, so they are read and written under its lock;
-;; a thread holds at most one lock at a time.
+;; by its producer and consumer, so they are read and written under its lock.
+;; Locks nest only consumer before producer (nile_Process_producer_state, remove)
+;; and, for Zip, the shared lock before a zipper's before its consumer's; a lock
+;; wanted the other way is only tried (nile_trylock), never waited for.
 
 (define (NILE_NOT_BLOCKED int) 0)
 (define (NILE_BLOCKED_ON_PRODUCER int) 1)
@@ -425,21 +427,35 @@
 
 ;; The process has stopped at a buffer boundary: an error or quota backs it up
 ;; to its consumer; otherwise it has run out of input.
+;; Its consumer, the mark blocked and the consumer's state are one decision, under p's lock with the consumer's
+;; tried inside it: p's lock keeps the consumer from being freed (its removal relinks p under p's lock first), and
+;; holds off a Zip sibling's claim, which reads p's consumer and state under p's lock. Read apart, the consumer could
+;; be taken by the sibling after it was read (p then blocked on a consumer it no longer had), or remove itself and be
+;; freed before its state was read. The consumer's lock is wanted against the order (consumer before producer), so
+;; it is only tried, and p's let go and taken again until it is had.
 (define-function nile_Process_handle_backpressure void ((p struct nile_Process *))
-  (let (((c struct nile_Process *) (nile_Process_consumer_of p))
-	((t struct nile_Thread *) (nile_Process_deactivate p))
-	((cstate int) 0))
+  (let (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((c struct nile_Process *) (cast 0 struct nile_Process *))
+	((cstate int) 0)
+	((done int) 0))
+    (while (= done 0)
+      (nile_lock (. (indir p) lock))
+      (set c (. (indir p) consumer))
+      (set (. (indir p) state) NILE_BLOCKED_ON_CONSUMER)
+      (if (= 0 (cast c long))
+	  (set done 1)
+	  (if (nile_trylock (. (indir c) lock))
+	      (let ()
+		(set cstate (. (indir c) state))
+		(nile_unlock (. (indir c) lock))
+		(set done 1))))
+      (nile_unlock (. (indir p) lock)))
     (if (= 0 (cast c long))
-	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on (marked
-	;; blocked first, as a process is when scheduled, so the scheduler's claim takes it)
-	(let ()
-	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
-	  (nile_Process_schedule_on p t))
-	(let ()
-	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
-	  (set cstate (nile_Process_state_of c))
-	  (if (= cstate NILE_BLOCKED_ON_PRODUCER)
-	      (nile_Process_schedule_on c t))))))
+	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on (marked blocked
+	;; above, so the scheduler's claim takes it)
+	(nile_Process_schedule_on p t)
+	(if (= cstate NILE_BLOCKED_ON_PRODUCER)
+	    (nile_Process_schedule_on c t)))))
 
 ;; The process has no input left: it waits on its producer, or runs its epilogue
 ;; and is removed, or is removed when it has no producer. The producer is the one block_on_producer

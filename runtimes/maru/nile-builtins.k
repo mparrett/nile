@@ -763,14 +763,15 @@
 	 ((sv struct nile_Zip_vars *) (nile_Zip_vars_of sib))
 	 ((first int) 0)
 	 ((cur struct nile_Buffer *) (cast 0 struct nile_Buffer *)))
+    ;; Deactivate first, as C's nile_Zip_epilogue does: the process's heap goes to its thread whichever zipper
+    ;; finished first, and the second activates for its own pair. Activating a process that still holds its heap
+    ;; (the second zipper, which never deactivated) overwrote that heap and dropped its blocks. And before saying it
+    ;; is no longer alive: from then the other may finish and free this block, so the first touches nothing after.
+    (nile_Process_deactivate p)
     (nile_lock (. (indir shared) lock))
     (set first (. (indir sv) alive))
     (set (. (indir v) alive) 0)
     (nile_unlock (. (indir shared) lock))
-    ;; Deactivate first, as C's nile_Zip_epilogue does: the process's heap goes to its thread whichever zipper
-    ;; finished first, and the second activates for its own pair. Activating a process that still holds its heap
-    ;; (the second zipper, which never deactivated) overwrote that heap and dropped its blocks.
-    (nile_Process_deactivate p)
     (if (= 1 first)
 	(let ()
 	  (set (. (indir t) handed) 1)
