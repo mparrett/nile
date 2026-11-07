@@ -2,7 +2,8 @@
 ;; check/laws/runtime.law (the laws run it through check/laws/runtime.l, one process per question).
 ;;
 ;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default), and
-;; argv[4], when given, a schedule's seed: the threads take turns in the order it decides (nile_schedule), and a
+;; argv[4], when given, a schedule: a number is a seed, the threads taking turns in the order it decides (nile_schedule),
+;; and "after:who,after:who,..." a plan of preemptions (nile_schedule_plan); either way a
 ;; last line follows the output, "contracts D R U K": buffers dropped, processes queued while running or after
 ;; being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its contracts.
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
@@ -16,6 +17,8 @@
 
 (define (printf (int char * ...) *) (extern printf))
 (define (getenv (char * char *) *) (extern getenv))
+(define (strtol (long char * char * * int) *) (extern strtol))
+(define (strchr (char * char * int) *) (extern strchr))
 (define (dprintf (int int char * ...) *) (extern dprintf))
 (define (scanf (int char * ...) *) (extern scanf))
 (define (malloc (void * long) *) (extern malloc))
@@ -77,6 +80,22 @@
 
 ;; a missing or unknown mode, or a worker count outside 1 to MAX_THREADS, exits 2; memory that can't be had, 1.  Through exit:
 ;; ir-gen-c.k's C main drops f_main's result and returns 0
+;; reads "after:who,after:who,..." into pairs and takes turns by them
+(define-function schedule_plan void ((text char *))
+  (let (((plan long *) (cast (malloc 8192) long *))
+	((n int) 0)
+	((p char *) text)
+	((e char *) text))
+    (while (and (!= 0 (cast (indir p) int)) (< n 512))
+      (set (indir plan (* 2 n)) (strtol p (addressof e) 10))
+      (set p e)
+      (if (= 58 (cast (indir p) int)) (set p (+ p 1)))
+      (set (indir plan (+ 1 (* 2 n))) (strtol p (addressof e) 10))
+      (set p e)
+      (if (= 44 (cast (indir p) int)) (set p (+ p 1)))
+      (set n (+ n 1)))
+    (nile_schedule_plan plan n)))
+
 (define-function main int ((argc int) (argv char * *))
   (if (< argc 3)
       (exit 2))
@@ -96,7 +115,9 @@
 	(exit 2))
     (set nbytes (* NBYTES_PER_THREAD nthreads))
     (if (> argc 4)
-	(nile_schedule (cast (atoi (indir argv 4)) long)))
+	(if (!= 0 (cast (strchr (indir argv 4) 58) long))	; a ':': a plan
+	    (schedule_plan (indir argv 4))
+	    (nile_schedule (cast (atoi (indir argv 4)) long))))
     (if (!= 0 (cast (getenv "NILE_TRACE") long))
 	(nile_trace_on))
     (set mem (malloc (cast nbytes long)))
@@ -117,7 +138,7 @@
     (if (> argc 4)
 	(let ()
 	  (printf "contracts %d %d %d %d\n" (nile_dropped init) (nile_requeued init) (nile_unreturned init) (nile_deadlocks))
-	  (dprintf 2 "handoffs %d\n" (nile_handoffs))
+	  (dprintf 2 "handoffs %d turns %ld\n" (nile_handoffs) nile_sched_steps)
 	  (if (< 0 (nile_deadlocks)) (nile_print_state init))
 	  (if (< 0 (nile_unreturned init)) (nile_print_live))))
     (free (nile_shutdown init))

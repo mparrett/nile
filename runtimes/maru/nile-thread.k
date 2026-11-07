@@ -575,4 +575,4 @@
 
 (export nile_print_state)
 (export nile_startup nile_shutdown nile_sync nile_status nile_error nile_print_leaks nile_dropped nile_requeued
-	nile_unreturned nile_schedule nile_deadlocks nile_handoffs)
+	nile_unreturned nile_schedule nile_schedule_plan nile_deadlocks nile_handoffs)

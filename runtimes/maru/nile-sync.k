@@ -77,6 +77,17 @@
 (define (nile_sched_steps long))	; turns so far
 (define (nile_sched_dump (void void *) *))	; prints the runtime's state at a deadlock (nile_startup sets it)
 (define (nile_sched_dump_arg void *))
+;; A planned schedule (nile_schedule_plan) delays a round robin (delay bounding: Emmi, Qadeer and Rakamaric, POPL 2011):
+;; each turn goes to the next runnable slot after the one running, in slot order, round; the plan's pairs (after, who)
+;; say: after this many more turns, skip who + 1 runnable slots instead of one. So a plan's length is its number of
+;; delays, and every plan of at most D pairs is every schedule within D delays (at the turns the pairs can name). A
+;; round robin interleaves the threads from the start; running each until it blocks left one thread doing the work,
+;; and no plan of two preemptions found any of the races the seeded schedules did.
+(define (nile_sched_planned int))
+(define (nile_sched_plan long *))	; after, who, after, who, ...
+(define (nile_sched_plan_n int))	; pairs
+(define (nile_sched_plan_i int))	; the pair due next
+(define (nile_sched_left long))		; turns before it is due
 (define (nile_sched_lock struct nile_Mutex))
 (define (nile_sched_wake struct nile_Cond))
 
@@ -101,6 +112,15 @@
       (set i (+ i 1))))
   (set nile_sched_deadlocks 0)
   (set nile_sched_on 1))
+
+;; Takes turns by a plan of n preemptions, pairs (after, who) at plan, instead of a seed's priorities.
+(define-function nile_schedule_plan void ((plan long *) (n int))
+  (nile_schedule 0)
+  (set nile_sched_plan plan)
+  (set nile_sched_plan_n n)
+  (set nile_sched_plan_i 0)
+  (set nile_sched_left (if (> n 0) (indir plan 0) 0))
+  (set nile_sched_planned 1))
 
 ;; the slot of the calling thread; -1 for one that isn't taking turns
 (define-function nile_sched_me int ()
@@ -136,9 +156,34 @@
       (set i (+ i 1)))
     (return best)))
 
-;; Under the scheduler's lock: a turn passes. At a change point the running slot's priority drops below
-;; every other's; then the turn goes to the slot nile_sched_best names, or, with none, a deadlock is counted
-;; and the schedule ends.
+;; Under the scheduler's lock, a planned turn: the slot that runs next, or -1 when none is runnable. The round robin
+;; steps one runnable slot past the running one, or, with a delay due, who + 1.
+(define-function nile_sched_planned_next int ()
+  (let (((i int) 0) ((step long) 1) ((next int) -1) ((n int) 0)
+	((cur int) nile_sched_turn))
+    (if (< nile_sched_plan_i nile_sched_plan_n)
+	(if (> nile_sched_left 0)
+	    (set nile_sched_left (- nile_sched_left 1))
+	    (let ()
+	      (set step (+ 1 (indir nile_sched_plan (+ 1 (* 2 nile_sched_plan_i)))))
+	      (set nile_sched_plan_i (+ nile_sched_plan_i 1))
+	      (if (< nile_sched_plan_i nile_sched_plan_n)
+		  (set nile_sched_left (indir nile_sched_plan (* 2 nile_sched_plan_i)))))))
+    (while (< i NILE_SLOTS)
+      (if (= SLOT_RUNNABLE (indir nile_sched_state i)) (set n (+ n 1)))
+      (set i (+ i 1)))
+    (if (> n 0)
+	(let (((k long) (% step (cast n long))) ((s int) cur))
+	  (if (= k 0) (set k (cast n long)))	; a full round: back to the same, if it can run
+	  (while (> k 0)
+	    (set s (% (+ s 1) NILE_SLOTS))
+	    (if (= SLOT_RUNNABLE (indir nile_sched_state s)) (set k (- k 1))))
+	  (set next s)))
+    (return next)))
+
+;; Under the scheduler's lock: a turn passes. Planned, the plan decides; otherwise at a change point the running
+;; slot's priority drops below every other's, and the turn goes to the slot nile_sched_best names. With none, a
+;; deadlock is counted and the schedule ends.
 (define-function nile_sched_pass void ()
   (let (((i int) 0) ((next int) -1))
     (set nile_sched_steps (+ nile_sched_steps 1))
@@ -146,7 +191,7 @@
       (if (= nile_sched_steps (indir nile_sched_change i))
 	  (set (indir nile_sched_prio nile_sched_turn) (- 0 nile_sched_steps)))
       (set i (+ i 1)))
-    (set next (nile_sched_best SLOT_RUNNABLE))
+    (set next (if nile_sched_planned (nile_sched_planned_next) (nile_sched_best SLOT_RUNNABLE)))
     (if (< next 0)
 	(let ()
 	  (set next (nile_sched_best SLOT_SPIN))

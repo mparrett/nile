@@ -42,6 +42,10 @@
 (define (nile_schedule (void long) *)
   (extern nile_schedule))
 
+;; or by a plan of n preemptions, pairs (after, who)
+(define (nile_schedule_plan (void long * int) *)
+  (extern nile_schedule_plan))
+
 (define (nile_deadlocks (int void) *)
   (extern nile_deadlocks))
 
