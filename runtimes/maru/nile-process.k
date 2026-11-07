@@ -458,7 +458,9 @@
 	(if (!= 0 (cast pr long))
 	    (nile_Process_schedule_on pr t)
 	    (if (> (nile_Process_input_n p) 0)
-		(nile_Process_schedule_on p t)
+		(let ()		; input left and no producer: it runs again, marked waiting first so the scheduler's claim takes it
+		  (nile_Process_set_state p NILE_BLOCKED_ON_PRODUCER)
+		  (nile_Process_schedule_on p t))
 		(if (!= 0 (cast (. (indir p) epilogue) long))
 		    (nile_Process_epilogue p t)
 		    (set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap)))))))))

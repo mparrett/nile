@@ -42,6 +42,10 @@
 (define (nile_schedule (void long) *)
   (extern nile_schedule))
 
+;; or by a PCT schedule given in full: starting priorities by slot, and the turns where the running one drops
+(define (nile_schedule_pct (void long * int long * int) *)
+  (extern nile_schedule_pct))
+
 ;; or by a plan of n preemptions, pairs (after, who)
 (define (nile_schedule_plan (void long * int) *)
   (extern nile_schedule_plan))

@@ -3,7 +3,8 @@
 ;;
 ;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default), and
 ;; argv[4], when given, a schedule: a number is a seed, the threads taking turns in the order it decides (nile_schedule),
-;; and "after:who,after:who,..." a plan of preemptions (nile_schedule_plan); either way a
+;; "pct:P0,P1,.../C1,C2,..." a PCT schedule in full (nile_schedule_pct: slot priorities, then the turns where the running
+;; thread's drops), and "after:who,after:who,..." a plan of delays (nile_schedule_plan); either way a
 ;; last line follows the output, "contracts D R U K": buffers dropped, processes queued while running or after
 ;; being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its contracts.
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
@@ -80,6 +81,32 @@
 
 ;; a missing or unknown mode, or a worker count outside 1 to MAX_THREADS, exits 2; memory that can't be had, 1.  Through exit:
 ;; ir-gen-c.k's C main drops f_main's result and returns 0
+;; reads numbers separated by commas from text into out, up to max, stopping at a '/' or the end; returns how many, and
+;; leaves *rest after the '/'
+(define-function read_numbers int ((text char *) (out long *) (max int) (rest char * *))
+  (let (((n int) 0)
+	((p char *) text)
+	((e char *) text))
+    (while (and (!= 0 (cast (indir p) int)) (!= 47 (cast (indir p) int)) (< n max))
+      (set (indir out n) (strtol p (addressof e) 10))
+      (if (= (cast e long) (cast p long)) (set p (+ p 1)) (set p e))	; no number: skip the character
+      (if (= 44 (cast (indir p) int)) (set p (+ p 1)))
+      (set n (+ n 1)))
+    (if (= 47 (cast (indir p) int)) (set p (+ p 1)))
+    (set (indir rest) p)
+    (return n)))
+
+;; reads "P0,P1,.../C1,C2,..." and takes turns by that PCT schedule
+(define-function schedule_pct void ((text char *))
+  (let (((prios long *) (cast (malloc 1024) long *))
+	((changes long *) (cast (malloc 1024) long *))
+	((rest char *) text)
+	((np int) 0)
+	((nc int) 0))
+    (set np (read_numbers text prios 128 (addressof rest)))
+    (set nc (read_numbers rest changes 128 (addressof rest)))
+    (nile_schedule_pct prios np changes nc)))
+
 ;; reads "after:who,after:who,..." into pairs and takes turns by them
 (define-function schedule_plan void ((text char *))
   (let (((plan long *) (cast (malloc 8192) long *))
@@ -115,9 +142,11 @@
 	(exit 2))
     (set nbytes (* NBYTES_PER_THREAD nthreads))
     (if (> argc 4)
-	(if (!= 0 (cast (strchr (indir argv 4) 58) long))	; a ':': a plan
-	    (schedule_plan (indir argv 4))
-	    (nile_schedule (cast (atoi (indir argv 4)) long))))
+	(if (= 112 (cast (indir (indir argv 4)) int))	; "pct:...": a PCT schedule in full
+	    (schedule_pct (+ (indir argv 4) 4))
+	    (if (!= 0 (cast (strchr (indir argv 4) 58) long))	; a ':': a plan
+		(schedule_plan (indir argv 4))
+		(nile_schedule (cast (atoi (indir argv 4)) long)))))
     (if (!= 0 (cast (getenv "NILE_TRACE") long))
 	(nile_trace_on))
     (set mem (malloc (cast nbytes long)))

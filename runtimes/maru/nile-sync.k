@@ -75,6 +75,9 @@
 (define (nile_sched_prio long *))	; slot -> its priority
 (define (nile_sched_change long *))	; the turns at which the running thread's priority drops
 (define (nile_sched_steps long))	; turns so far
+(define (nile_sched_nchanges int))	; change points in nile_sched_change
+(define (nile_sched_fixed long *))	; slot -> its starting priority, when a test gives them (nile_schedule_pct)
+(define (nile_sched_nfixed int))
 (define (nile_sched_dump (void void *) *))	; prints the runtime's state at a deadlock (nile_startup sets it)
 (define (nile_sched_dump_arg void *))
 ;; A planned schedule (nile_schedule_plan) delays a round robin (delay bounding: Emmi, Qadeer and Rakamaric, POPL 2011):
@@ -106,12 +109,23 @@
   (pthread_cond_init (addressof nile_sched_wake) (cast 0 void *))
   (set nile_sched_seed seed)
   (set nile_sched_steps 0)
+  (set nile_sched_nchanges NILE_CHANGES)
   (let (((i int) 0))
     (while (< i NILE_CHANGES)
       (set (indir nile_sched_change i) (+ 1 (% (nile_sched_next) (cast NILE_HORIZON long))))
       (set i (+ i 1))))
   (set nile_sched_deadlocks 0)
   (set nile_sched_on 1))
+
+;; Takes turns by a PCT schedule given in full: slot i starts at priority prios[i] (0 past np), and at each of the nc turns
+;; in changes the running slot's priority drops below every other's. A law's schedule term is this, so shrinking it
+;; shrinks the schedule itself, and a refutation reads as one.
+(define-function nile_schedule_pct void ((prios long *) (np int) (changes long *) (nc int))
+  (nile_schedule 0)
+  (set nile_sched_fixed prios)
+  (set nile_sched_nfixed np)
+  (set nile_sched_change changes)
+  (set nile_sched_nchanges nc))
 
 ;; Takes turns by a plan of n preemptions, pairs (after, who) at plan, instead of a seed's priorities.
 (define-function nile_schedule_plan void ((plan long *) (n int))
@@ -138,7 +152,9 @@
       (let ()
 	(pthread_mutex_lock (addressof nile_sched_lock))
 	(set (indir nile_sched_state a) SLOT_RUNNABLE)
-	(set (indir nile_sched_prio a) (+ 100000 (nile_sched_next)))
+	(set (indir nile_sched_prio a) (+ 100000 (if (!= 0 (cast nile_sched_fixed long))
+						      (if (< a nile_sched_nfixed) (indir nile_sched_fixed a) 0)
+						      (nile_sched_next))))
 	(if id
 	    (let ()
 	      (set (indir nile_sched_ids a) (pthread_self))
@@ -187,7 +203,7 @@
 (define-function nile_sched_pass void ()
   (let (((i int) 0) ((next int) -1))
     (set nile_sched_steps (+ nile_sched_steps 1))
-    (while (< i NILE_CHANGES)
+    (while (< i nile_sched_nchanges)
       (if (= nile_sched_steps (indir nile_sched_change i))
 	  (set (indir nile_sched_prio nile_sched_turn) (- 0 nile_sched_steps)))
       (set i (+ i 1)))
