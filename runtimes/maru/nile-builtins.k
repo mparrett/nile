@@ -77,20 +77,27 @@
 ;; consumer's quota: it returns when the consumer releases p or the runtime errs.
 (define-function nile_Funnel_wait_unblocked void ((t struct nile_Thread *) (p struct nile_Process *))
   (let (((seen int) 0)
+	((go int) 1)
 	((nd struct nile_Node *) (cast 0 struct nile_Node *)))
-    (while (and (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of p))
-		(= NILE_STATUS_OK (nile_Thread_status_of t)))
+    (while go
+      ;; the tick before the state: a release after this read moves the tick past seen, so sleep_from won't
+      ;; sleep through it. Read after the state, a release between the two was lost, and the liaison slept
+      ;; with its funnel free and nothing else to wake it.
       (nile_lock (. (indir t) lock))
       (set seen (. (indir t) ntick))
       (nile_unlock (. (indir t) lock))
-      (set nd (nile_Thread_pop_own t))
-      (if (= 0 (cast nd long))
-	  (set nd (nile_Thread_steal_process t)))
-      (if (!= 0 (cast nd long))
+      (set go (and (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of p))
+		   (= NILE_STATUS_OK (nile_Thread_status_of t))))
+      (if go
 	  (let ()
-	    (nile_Process_run (cast nd struct nile_Process *) t)
-	    (nile_Thread_finished t))
-	  (nile_Thread_sleep_from t seen)))))
+	    (set nd (nile_Thread_pop_own t))
+	    (if (= 0 (cast nd long))
+		(set nd (nile_Thread_steal_process t)))
+	    (if (!= 0 (cast nd long))
+		(let ()
+		  (nile_Process_run (cast nd struct nile_Process *) t)
+		  (nile_Thread_finished t))
+		(nile_Thread_sleep_from t seen)))))))
 
 ;; Pours n floats into funnel p. The liaison runs the funnel itself, and waits
 ;; whenever the consumer holds it at quota. eos marks the last pour: the
@@ -358,7 +365,7 @@
 	(let () (set fuller p2) (set other p1)))
     (nile_Process_set_producer other other)
     (nile_Process_join p fuller)
-    (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+    (nile_Process_stop_for_consumer p)
     (return 1)))
 
 (define-function nile_Dup_body int
@@ -619,6 +626,26 @@
 (define-function nile_Zip_vars_of (struct nile_Zip_vars *) ((p nile_Process_t *))
   (return (cast (nile_Process_memory p) struct nile_Zip_vars *)))
 
+;; A zipper with no consumer of its own hands on to its sibling's, read under the shared lock as
+;; nile_Zip_claim decides them.
+(define-function nile_Zip_adopt void ((p nile_Process_t *) (v struct nile_Zip_vars *))
+  (let (((shared struct nile_Process *) (. (indir v) shared))
+	((sib struct nile_Process *) (. (indir v) sibling))
+	((c struct nile_Process *) (cast 0 struct nile_Process *)))
+    (nile_lock (. (indir shared) lock))
+    (nile_lock (. (indir p) lock))
+    (set c (. (indir p) consumer))
+    (nile_unlock (. (indir p) lock))
+    (if (= 0 (cast c long))
+	(let ()
+	  (nile_lock (. (indir sib) lock))
+	  (set c (. (indir sib) consumer))
+	  (nile_unlock (. (indir sib) lock))
+	  (nile_lock (. (indir p) lock))
+	  (set (. (indir p) consumer) c)
+	  (nile_unlock (. (indir p) lock))))
+    (nile_unlock (. (indir shared) lock))))
+
 ;; The shared buffer is full for this zipper. If the sibling hasn't yet queued the next one, this
 ;; zipper queues it and fills it next, and hands nothing on. Otherwise the sibling got there first:
 ;; this zipper pops the buffer both have filled and hands it to the consumer. Returns 1 when the
@@ -645,16 +672,48 @@
 	(let ()
 	  (nile_Process_free_node p (cast fresh struct nile_Node *))
 	  (set (. (indir cur) tail) (- (. (indir v) jn) (. (indir v) j0)))
-	  (nile_lock (. (indir p) lock))
-	  (if (= 0 (cast (. (indir p) consumer) long))
-	      (set (. (indir p) consumer) (. (indir (. (indir v) sibling)) consumer)))
-	  (nile_unlock (. (indir p) lock))
+	  (nile_Zip_adopt p v)
 	  (nile_Process_enqueue_output p cur)
 	  (nile_lock (. (indir shared) lock))
 	  (set (. (indir v) cur) (cast (. (indir q) head) struct nile_Buffer *))
 	  (nile_unlock (. (indir shared) lock))
 	  (set stop (nile_Process_quota_hit (nile_Process_consumer_of p)))))
     (return stop)))
+
+;; This zipper takes the consumer, its own or its sibling's, and becomes the consumer's producer; the
+;; sibling's is cleared. All of it is one decision under the shared lock, which nothing takes while
+;; holding a process lock: when both zippers stopped at once, each read its own consumer and cleared
+;; the other's in separate sections, and both could end with none, the consumer waiting on a zipper
+;; that no longer fed it (nile_Process_handle_backpressure reschedules the one left without one). A
+;; sibling already blocked on the consumer this takes waits on nothing now (only its consumer would have woken
+;; it, and that consumer's producer is this zipper), so it is scheduled.
+(define-function nile_Zip_claim void ((p nile_Process_t *) (v struct nile_Zip_vars *))
+  (let (((shared struct nile_Process *) (. (indir v) shared))
+	((sib struct nile_Process *) (. (indir v) sibling))
+	((orphaned int) 0)
+	((c struct nile_Process *) (cast 0 struct nile_Process *)))
+    (nile_lock (. (indir shared) lock))
+    (nile_lock (. (indir p) lock))
+    (set c (. (indir p) consumer))
+    (nile_unlock (. (indir p) lock))
+    (nile_lock (. (indir sib) lock))
+    (if (= 0 (cast c long))
+	(set c (. (indir sib) consumer)))
+    (set orphaned (and (!= 0 (cast (. (indir sib) consumer) long))
+		       (= NILE_BLOCKED_ON_CONSUMER (. (indir sib) state))))
+    (set (. (indir sib) consumer) (cast 0 struct nile_Process *))
+    (nile_unlock (. (indir sib) lock))
+    (nile_lock (. (indir p) lock))
+    (set (. (indir p) consumer) c)
+    (nile_unlock (. (indir p) lock))
+    (if (!= 0 (cast c long))
+	(let ()
+	  (nile_lock (. (indir c) lock))
+	  (set (. (indir c) producer) p)
+	  (nile_unlock (. (indir c) lock))))
+    (nile_unlock (. (indir shared) lock))
+    (if orphaned
+	(nile_Process_schedule_on sib (. (indir p) thread)))))
 
 (define-function nile_Zip_body int
   ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
@@ -686,17 +745,10 @@
 	  (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m)))))
     ;; the consumer is at quota, or the runtime stopped us there: it waits on this zipper, and the
     ;; sibling no longer feeds it, as C's quota handling does.
-    (if (or (= stop 1) (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of p)))
-	(let ((c (nile_Process_consumer_of p)))
-	  (if (!= 0 (cast c long))
-	      (let ()
-		(nile_lock (. (indir c) lock))
-		(set (. (indir c) producer) p)
-		(nile_unlock (. (indir c) lock))))
-	  (nile_lock (. (indir (. (indir v) sibling)) lock))
-	  (set (. (indir (. (indir v) sibling)) consumer) (cast 0 struct nile_Process *))
-	  (nile_unlock (. (indir (. (indir v) sibling)) lock))
-	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)))
+    (if (or (= stop 1) (. (indir (. (indir p) thread)) stopped))
+	(let ()
+	  (nile_Zip_claim p v)
+	  (nile_Process_stop_for_consumer p)))
     (return (nile_Process_return p i j NILE_STATUS_OK))))
 
 ;; The second zipper to finish hands on the shared buffer that is still being filled, with its
@@ -711,14 +763,15 @@
 	 ((sv struct nile_Zip_vars *) (nile_Zip_vars_of sib))
 	 ((first int) 0)
 	 ((cur struct nile_Buffer *) (cast 0 struct nile_Buffer *)))
+    ;; Deactivate first, as C's nile_Zip_epilogue does: the process's heap goes to its thread whichever zipper
+    ;; finished first, and the second activates for its own pair. Activating a process that still holds its heap
+    ;; (the second zipper, which never deactivated) overwrote that heap and dropped its blocks. And before saying it
+    ;; is no longer alive: from then the other may finish and free this block, so the first touches nothing after.
+    (nile_Process_deactivate p)
     (nile_lock (. (indir shared) lock))
     (set first (. (indir sv) alive))
     (set (. (indir v) alive) 0)
     (nile_unlock (. (indir shared) lock))
-    ;; Deactivate first, as C's nile_Zip_epilogue does: the process's heap goes to its thread whichever zipper
-    ;; finished first, and the second activates for its own pair. Activating a process that still holds its heap
-    ;; (the second zipper, which never deactivated) overwrote that heap and dropped its blocks.
-    (nile_Process_deactivate p)
     (if (= 1 first)
 	(let ()
 	  (set (. (indir t) handed) 1)
@@ -816,5 +869,27 @@
 	  (set (. (indir v) p2q) p2_out_quantum)))
     (return p)))
 
+;; Every block still holding a process (a freed one's type is overwritten by the heap's link), to stderr: what a test prints
+;; when a sync left blocks behind. The built-ins are named.
+(define-function nile_print_live void ()
+  (let (((b long) nile_blocks_from))
+    (while (< (+ b BLOCK_BYTES) nile_blocks_to)
+      (let (((p struct nile_Process *) (cast b struct nile_Process *)))
+	(if (= NILE_PROCESS_TYPE (. (indir p) type))
+	    (let (((f long) (cast (. (indir p) body) long)))
+	      (dprintf 2 "# live %lx %s state %d input %d producer %lx consumer %lx epilogue %d\n" b
+		       (cond ((= f (cast nile_Zip_body long)) "zip")
+			     ((= f (cast nile_Dup_body long)) "dup")
+			     ((= f (cast nile_Capture_body long)) "capture")
+			     ((= f (cast nile_Funnel_body long)) "funnel")
+			     ((= f (cast nile_Process_default_body long)) "pass")
+			     ((= f 0) "none")
+			     (else "kernel"))
+		       (. (indir p) state) (. (indir (. (indir p) input)) n)
+		       (cast (. (indir p) producer) long) (cast (. (indir p) consumer) long)
+		       (!= 0 (cast (. (indir p) epilogue) long))))))
+      (set b (+ b BLOCK_BYTES)))))
+
+(export nile_print_live)
 (export nile_PassThrough nile_Capture nile_Funnel nile_Funnel_pour nile_Reverse nile_SortBy nile_DupCat nile_DupZip)
 

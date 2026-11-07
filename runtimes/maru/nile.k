@@ -29,6 +29,33 @@
 (define (nile_error (int nile_Process_t *) *)
   (extern nile_error))
 
+(define (nile_dropped (int nile_Process_t *) *)
+  (extern nile_dropped))
+
+(define (nile_requeued (int nile_Process_t *) *)
+  (extern nile_requeued))
+
+(define (nile_unreturned (int nile_Process_t *) *)
+  (extern nile_unreturned))
+
+;; a test's schedule: before nile_startup, the threads take turns in an order the seed decides
+(define (nile_schedule (void long) *)
+  (extern nile_schedule))
+
+;; or by a PCT schedule given in full: starting priorities by slot, and the turns where the running one drops
+(define (nile_schedule_pct (void long * int long * int) *)
+  (extern nile_schedule_pct))
+
+(define (nile_deadlocks (int void) *)
+  (extern nile_deadlocks))
+
+(define (nile_handoffs (int void) *)
+  (extern nile_handoffs))
+
+
+(define (nile_print_live (void void) *)
+  (extern nile_print_live))
+
 (define (nile_print_leaks (void nile_Process_t *) *)
   (extern nile_print_leaks))
 

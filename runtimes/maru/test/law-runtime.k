@@ -1,7 +1,12 @@
 ;; law-runtime.k -- one built-in or text-layout pipeline, run over integers read from stdin, for
 ;; check/laws/runtime.law (the laws run it through check/laws/runtime.l, one process per question).
 ;;
-;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default).
+;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default), and
+;; argv[4], when given, a schedule: a number is a seed, the threads taking turns in the order it decides (nile_schedule),
+;; and "pct:P0,P1,.../C1,C2,..." a PCT schedule in full (nile_schedule_pct: slot priorities, then the turns where the running
+;; thread's drops). Either way a last line follows the output, "contracts D R U K": buffers dropped, processes queued while
+;; running or after being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its
+;; contracts; a run that leaves blocks behind lists the processes still alive on stderr (nile_print_live).
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
 ;;       (key, payload) with field 0 the key); the built-ins run over quantum 1 (sort: 2) and print the
 ;;       output floats, one integer per line, as the runtime's Capture gives them.
@@ -12,6 +17,8 @@
 ;; worker count outside 1 to 64, exits 2.
 
 (define (printf (int char * ...) *) (extern printf))
+(define (strtol (long char * char * * int) *) (extern strtol))
+(define (dprintf (int int char * ...) *) (extern dprintf))
 (define (scanf (int char * ...) *) (extern scanf))
 (define (malloc (void * long) *) (extern malloc))
 (define (free (void void *) *) (extern free))
@@ -72,6 +79,32 @@
 
 ;; a missing or unknown mode, or a worker count outside 1 to MAX_THREADS, exits 2; memory that can't be had, 1.  Through exit:
 ;; ir-gen-c.k's C main drops f_main's result and returns 0
+;; reads numbers separated by commas from text into out, up to max, stopping at a '/' or the end; returns how many, and
+;; leaves *rest after the '/'
+(define-function read_numbers int ((text char *) (out long *) (max int) (rest char * *))
+  (let (((n int) 0)
+	((p char *) text)
+	((e char *) text))
+    (while (and (!= 0 (cast (indir p) int)) (!= 47 (cast (indir p) int)) (< n max))
+      (set (indir out n) (strtol p (addressof e) 10))
+      (if (= (cast e long) (cast p long)) (set p (+ p 1)) (set p e))	; no number: skip the character
+      (if (= 44 (cast (indir p) int)) (set p (+ p 1)))
+      (set n (+ n 1)))
+    (if (= 47 (cast (indir p) int)) (set p (+ p 1)))
+    (set (indir rest) p)
+    (return n)))
+
+;; reads "P0,P1,.../C1,C2,..." and takes turns by that PCT schedule
+(define-function schedule_pct void ((text char *))
+  (let (((prios long *) (cast (malloc 1024) long *))
+	((changes long *) (cast (malloc 1024) long *))
+	((rest char *) text)
+	((np int) 0)
+	((nc int) 0))
+    (set np (read_numbers text prios 128 (addressof rest)))
+    (set nc (read_numbers rest changes 128 (addressof rest)))
+    (nile_schedule_pct prios np changes nc)))
+
 (define-function main int ((argc int) (argv char * *))
   (if (< argc 3)
       (exit 2))
@@ -90,6 +123,10 @@
     (if (or (< nthreads 1) (> nthreads MAX_THREADS) (= 0 (known_mode mode)))
 	(exit 2))
     (set nbytes (* NBYTES_PER_THREAD nthreads))
+    (if (> argc 4)
+	(if (= 112 (cast (indir (indir argv 4)) int))	; "pct:...": a PCT schedule in full
+	    (schedule_pct (+ (indir argv 4) 4))
+	    (nile_schedule (cast (atoi (indir argv 4)) long))))
     (set mem (malloc (cast nbytes long)))
     (if (or (= 0 (cast mem long)) (= 0 (cast data long)) (= 0 (cast out long)))
 	(exit 1))
@@ -105,6 +142,11 @@
 	(while (< k count)
 	  (printf "%d\n" (cast (indir out k) int))
 	  (set k (+ k 1))))
+    (if (> argc 4)
+	(let ()
+	  (printf "contracts %d %d %d %d\n" (nile_dropped init) (nile_requeued init) (nile_unreturned init) (nile_deadlocks))
+	  (dprintf 2 "handoffs %d turns %ld\n" (nile_handoffs) nile_sched_steps)
+	  (if (< 0 (nile_unreturned init)) (nile_print_live))))
     (free (nile_shutdown init))
     (free data)
     (free out)

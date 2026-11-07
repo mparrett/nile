@@ -4,8 +4,10 @@
 ;; buffer it writes; the kernel calls the interface in nile-kernel.k.
 ;;
 ;; A process runs on one thread at a time. Its input deque and state are read
-;; by its producer and consumer, so they are read and written under its lock;
-;; a thread holds at most one lock at a time.
+;; by its producer and consumer, so they are read and written under its lock.
+;; Locks nest only consumer before producer (nile_Process_producer_state, remove)
+;; and, for Zip, the shared lock before a zipper's before its consumer's; a lock
+;; wanted the other way is only tried (nile_trylock), never waited for.
 
 (define (NILE_NOT_BLOCKED int) 0)
 (define (NILE_BLOCKED_ON_PRODUCER int) 1)
@@ -215,18 +217,47 @@
 
 ;; ---------------------------------------------------------------- scheduling
 
-;; 1 when p should stay blocked: its producer is still making output, so p waits for it.
-(define-function nile_Process_block_on_producer int ((p struct nile_Process *))
-  (let (((pr struct nile_Process *) (nile_Process_producer_of p))
-	((pstate int) 0))
-    (if (= 0 (cast pr long))
-	(return 0))
-    (nile_Process_set_state p NILE_BLOCKED_ON_PRODUCER)
-    (set pstate (nile_Process_state_of pr))
-    (return (!= pstate NILE_BLOCKED_ON_CONSUMER))))
+;; p's producer, into seen, and that producer's state, read together under p's lock: -1 for no producer.
+;; With block set, p is marked blocked on its producer in the same section. A producer's block is freed
+;; only after its removal has rewritten p.producer under p's lock (nile_Process_remove), so the producer
+;; read here is alive while p's lock is held, and its state is read under its own lock inside p's. This
+;; is the runtime's only nesting of process locks, always consumer before producer; nothing takes a
+;; consumer's lock while holding its producer's. Reading the producer and its state in separate sections
+;; let its removal free the block between them, and the consumer read a reused block: it crashed, or it
+;; stayed blocked with nothing left to wake it.
+(define-function nile_Process_producer_state int
+  ((p struct nile_Process *) (block int) (seen struct nile_Process * *))
+  (let (((pr struct nile_Process *) (cast 0 struct nile_Process *))
+	((pstate int) -1))
+    (nile_lock (. (indir p) lock))
+    (set pr (. (indir p) producer))
+    (if (!= 0 (cast pr long))
+	(let ()
+	  (if block
+	      (set (. (indir p) state) NILE_BLOCKED_ON_PRODUCER))
+	  (if (= (cast pr long) (cast p long))	; not yet piped: a process starts as its own producer
+	      (set pstate (. (indir p) state))
+	      (let ()
+		(nile_lock (. (indir pr) lock))
+		(set pstate (. (indir pr) state))
+		(nile_unlock (. (indir pr) lock))))))
+    (nile_unlock (. (indir p) lock))
+    (if (!= 0 (cast seen long))
+	(set (indir seen) pr))
+    (return pstate)))
+
+;; 1 when p should stay blocked: its producer is still making output, so p waits for it. The producer
+;; it looked at goes into seen; when the answer is 0 that producer is 0, or blocked on p, and then
+;; only p can wake it, so the caller may schedule it.
+(define-function nile_Process_block_on_producer int ((p struct nile_Process *) (seen struct nile_Process * *))
+  (let (((pstate int) (nile_Process_producer_state p 1 seen)))
+    (return (and (!= pstate -1) (!= pstate NILE_BLOCKED_ON_CONSUMER)))))
 
 ;; Puts p on the thread's queue when it can run, or leaves it blocked. A process
-;; with no body is passed through and removed.
+;; with no body is passed through and removed. Queueing is claimed under p's lock: a process queued or running
+;; is NOT_BLOCKED, so of two threads that both saw it blocked only the first queues it. Each used to set it
+;; unblocked and queue it, so it sat in a queue twice, ran once, and ran again from the stale entry after it
+;; had been removed and its block freed.
 (define-function nile_Process_schedule (struct nile_Block *)
   ((p struct nile_Process *) (t struct nile_Thread *) (heap struct nile_Block *))
   (if (= 0 (cast (. (indir p) body) long))
@@ -236,10 +267,16 @@
 	(nile_Process_set_state p NILE_NOT_BLOCKED)
 	(nile_Thread_poke (nile_Thread_liaison t)))
       (if (or (>= (nile_Process_input_n p) INPUT_QUOTA)
-	      (= 0 (nile_Process_block_on_producer p)))
-	  (let ()
-	    (nile_Process_set_state p NILE_NOT_BLOCKED)
-	    (nile_Thread_append_to_q t (cast p struct nile_Node *)))))
+	      (= 0 (nile_Process_block_on_producer p (cast 0 struct nile_Process * *))))
+	  (let (((claimed int) 0))
+	    (nile_lock (. (indir p) lock))
+	    (if (!= NILE_NOT_BLOCKED (. (indir p) state))
+		(let ()
+		  (set (. (indir p) state) NILE_NOT_BLOCKED)
+		  (set claimed 1)))
+	    (nile_unlock (. (indir p) lock))
+	    (if claimed
+		(nile_Thread_append_to_q t (cast p struct nile_Node *))))))
   (return heap))
 
 ;; Schedules p on t's private heap.
@@ -250,7 +287,8 @@
 ;; joined to its consumer, and its block goes back to the heap.
 (define-function nile_Process_remove (struct nile_Block *)
   ((p struct nile_Process *) (t struct nile_Thread *) (heap struct nile_Block *))
-  (let (((producer struct nile_Process *) (nile_Process_producer_of p))
+  (let (((producer struct nile_Process *) (cast 0 struct nile_Process *))
+	((pstate int) -1)
 	((consumer struct nile_Process *) (nile_Process_consumer_of p))
 	((cstate int) 0)
 	((input struct nile_Deque *) (. (indir p) input)))
@@ -258,11 +296,22 @@
 	(let ()
 	  (nile_Thread_gate_done t)
 	  (set heap (nile_Process_schedule (. (indir p) gatee) t heap))))
-    (if (!= 0 (cast producer long))
+    ;; the producer is read, relinked to the consumer and its state read in one section under p's lock
+    ;; (consumer before producer, as nile_Process_producer_state nests them), so it can't be removed
+    ;; and its block reused between the three
+    (nile_lock (. (indir p) lock))
+    (set producer (. (indir p) producer))
+    (if (= (cast producer long) (cast p long))
 	(let ()
-	  (nile_lock (. (indir producer) lock))
-	  (set (. (indir producer) consumer) consumer)
-	  (nile_unlock (. (indir producer) lock))))
+	  (set (. (indir p) consumer) consumer)
+	  (set pstate (. (indir p) state)))
+	(if (!= 0 (cast producer long))
+	    (let ()
+	      (nile_lock (. (indir producer) lock))
+	      (set (. (indir producer) consumer) consumer)
+	      (set pstate (. (indir producer) state))
+	      (nile_unlock (. (indir producer) lock)))))
+    (nile_unlock (. (indir p) lock))
     (if (!= 0 (cast consumer long))
 	(let ()
 	  (nile_lock (. (indir consumer) lock))
@@ -282,13 +331,20 @@
 	  (set heap (. (indir p) heap))
 	  (nile_Heap_push (addressof heap) (cast p struct nile_Block *))
 	  (if (and (!= 0 (cast producer long))
-		   (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of producer)))
+		   (!= (cast producer long) (cast p long))
+		   (= NILE_BLOCKED_ON_CONSUMER pstate))
 	      (set heap (nile_Process_schedule producer t heap)))))
     (return heap)))
 
-;; Hands a buffer to p's consumer's input, or frees it when it is empty or p has no consumer.
+;; Hands a buffer to p's consumer's input, or frees it when it is empty or p has no consumer; one
+;; with data in it that has nowhere to go is counted on p's thread (nile_dropped).
 (define-function nile_Process_enqueue_output void ((p struct nile_Process *) (b struct nile_Buffer *))
   (let (((c struct nile_Process *) (nile_Process_consumer_of p)))
+    (if (and (= 0 (cast c long)) (!= (. (indir b) head) (. (indir b) tail)))
+	(let (((t struct nile_Thread *) (. (indir p) thread)))
+	  (nile_lock (. (indir t) lock))
+	  (set (. (indir t) dropped) (+ (. (indir t) dropped) 1))
+	  (nile_unlock (. (indir t) lock))))
     (if (or (= 0 (cast c long)) (= (. (indir b) head) (. (indir b) tail)))
 	(nile_Process_free_node p (cast b struct nile_Node *))
 	(let ()
@@ -331,12 +387,11 @@
 ;; Pops the input buffer at the head, which the kernel has used up, and schedules
 ;; the producer when this process had been at quota and the producer waits on it.
 (define-function nile_Process_pop_input void ((p struct nile_Process *))
-  (let (((pr struct nile_Process *) (nile_Process_producer_of p))
+  (let (((pr struct nile_Process *) (cast 0 struct nile_Process *))
 	((pstate int) 0)
 	((n int) 0)
 	((head struct nile_Node *) (cast 0 struct nile_Node *)))
-    (if (!= 0 (cast pr long))
-	(set pstate (nile_Process_state_of pr)))
+    (set pstate (nile_Process_producer_state p 0 (addressof pr)))
     (nile_lock (. (indir p) lock))
     (set n (. (indir (. (indir p) input)) n))
     (set head (nile_Deque_pop_head (. (indir p) input)))
@@ -352,6 +407,13 @@
     (if (and (!= 0 (cast b long)) (= (. (indir b) head) (. (indir b) tail)))
 	(nile_Process_pop_input p))))
 
+;; The running process stops for its consumer's quota. Its thread notes it for after_work, which
+;; blocks p on the consumer only once p is deactivated (nile_Process_handle_backpressure): the state is
+;; what other threads read, and a process they see blocked on its consumer they may schedule, so it must
+;; not read so while p still runs here, or p runs on two threads at once and one removes it under the other.
+(define-function nile_Process_stop_for_consumer void ((p struct nile_Process *))
+  (set (. (indir (. (indir p) thread)) stopped) 1))
+
 ;; 1 when the kernel must stop at this buffer boundary: the runtime has an
 ;; error, or the consumer is at quota (the process then waits on it).
 (define-function nile_Process_stop_wanted int ((p struct nile_Process *))
@@ -359,31 +421,55 @@
       (return 1))
   (if (nile_Process_quota_hit (nile_Process_consumer_of p))
       (let ()
-	(nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+	(nile_Process_stop_for_consumer p)
 	(return 1)))
   (return 0))
 
 ;; The process has stopped at a buffer boundary: an error or quota backs it up
 ;; to its consumer; otherwise it has run out of input.
+;; Its consumer, the mark blocked and the consumer's state are one decision, under p's lock with the consumer's
+;; tried inside it: p's lock keeps the consumer from being freed (its removal relinks p under p's lock first), and
+;; holds off a Zip sibling's claim, which reads p's consumer and state under p's lock. Read apart, the consumer could
+;; be taken by the sibling after it was read (p then blocked on a consumer it no longer had), or remove itself and be
+;; freed before its state was read. The consumer's lock is wanted against the order (consumer before producer), so
+;; it is only tried, and p's let go and taken again until it is had.
 (define-function nile_Process_handle_backpressure void ((p struct nile_Process *))
-  (let (((c struct nile_Process *) (nile_Process_consumer_of p))
-	((t struct nile_Thread *) (nile_Process_deactivate p))
-	((cstate int) 0))
-    (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
-    (set cstate (nile_Process_state_of c))
-    (if (= cstate NILE_BLOCKED_ON_PRODUCER)
-	(nile_Process_schedule_on c t))))
+  (let (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((c struct nile_Process *) (cast 0 struct nile_Process *))
+	((cstate int) 0)
+	((done int) 0))
+    (while (= done 0)
+      (nile_lock (. (indir p) lock))
+      (set c (. (indir p) consumer))
+      (set (. (indir p) state) NILE_BLOCKED_ON_CONSUMER)
+      (if (= 0 (cast c long))
+	  (set done 1)
+	  (if (nile_trylock (. (indir c) lock))
+	      (let ()
+		(set cstate (. (indir c) state))
+		(nile_unlock (. (indir c) lock))
+		(set done 1))))
+      (nile_unlock (. (indir p) lock)))
+    (if (= 0 (cast c long))
+	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on (marked blocked
+	;; above, so the scheduler's claim takes it)
+	(nile_Process_schedule_on p t)
+	(if (= cstate NILE_BLOCKED_ON_PRODUCER)
+	    (nile_Process_schedule_on c t)))))
 
 ;; The process has no input left: it waits on its producer, or runs its epilogue
-;; and is removed, or is removed when it has no producer.
+;; and is removed, or is removed when it has no producer. The producer is the one block_on_producer
+;; looked at: one read before it may have been removed since, its input handed to p.
 (define-function nile_Process_handle_out_of_input void ((p struct nile_Process *))
   (let (((t struct nile_Thread *) (nile_Process_deactivate p))
-	((pr struct nile_Process *) (nile_Process_producer_of p)))
-    (if (= 0 (nile_Process_block_on_producer p))
+	((pr struct nile_Process *) (cast 0 struct nile_Process *)))
+    (if (= 0 (nile_Process_block_on_producer p (addressof pr)))
 	(if (!= 0 (cast pr long))
 	    (nile_Process_schedule_on pr t)
 	    (if (> (nile_Process_input_n p) 0)
-		(nile_Process_schedule_on p t)
+		(let ()		; input left and no producer: it runs again, marked waiting first so the scheduler's claim takes it
+		  (nile_Process_set_state p NILE_BLOCKED_ON_PRODUCER)
+		  (nile_Process_schedule_on p t))
 		(if (!= 0 (cast (. (indir p) epilogue) long))
 		    (nile_Process_epilogue p t)
 		    (set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap)))))))))
@@ -399,6 +485,7 @@
 	(let ()
 	  (set (. (indir p) out) out)
 	  (set (. (indir t) handed) 0)
+	  (set (. (indir t) reading) (cast 0 struct nile_Buffer *))
 	  ((. (indir p) epilogue) p (cast 0 float *) 0 0
 	   (nile_Buffer_data out) (. (indir out) tail) (nile_Process_limit p))
 	  (if (= 0 (. (indir t) handed))
@@ -441,7 +528,7 @@
     (nile_lock (. (indir p) lock))
     (set (. (indir p) body) (cast 0 nile_Process_work_function_t))
     (nile_unlock (. (indir p) lock))
-    (if (= 0 (nile_Process_block_on_producer p))
+    (if (= 0 (nile_Process_block_on_producer p (cast 0 struct nile_Process * *)))
 	(set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap))))
     (return (nile_Thread_status_of t))))
 
@@ -451,7 +538,7 @@
   (nile_Process_drop_used p)
   (if (!= NILE_STATUS_OK (nile_Thread_status_of t))
       (nile_Process_deactivate p)
-      (if (= NILE_BLOCKED_ON_CONSUMER (nile_Process_state_of p))
+      (if (. (indir t) stopped)
 	  (nile_Process_handle_backpressure p)
 	  (nile_Process_handle_out_of_input p))))
 
@@ -468,6 +555,8 @@
 	  (set i (. (indir head) head))
 	  (set m (. (indir head) tail))))
     (set (. (indir t) handed) 0)
+    (set (. (indir t) stopped) 0)
+    (set (. (indir t) reading) head)
     (if (!= 0 (cast (. (indir p) prologue) long))
 	(let ()
 	  ((. (indir p) prologue) p (cast 0 float *) 0 0
