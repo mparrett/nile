@@ -252,7 +252,10 @@
     (return (and (!= pstate -1) (!= pstate NILE_BLOCKED_ON_CONSUMER)))))
 
 ;; Puts p on the thread's queue when it can run, or leaves it blocked. A process
-;; with no body is passed through and removed.
+;; with no body is passed through and removed. Queueing is claimed under p's lock: a process queued or running
+;; is NOT_BLOCKED, so of two threads that both saw it blocked only the first queues it. Each used to set it
+;; unblocked and queue it, so it sat in a queue twice, ran once, and ran again from the stale entry after it
+;; had been removed and its block freed.
 (define-function nile_Process_schedule (struct nile_Block *)
   ((p struct nile_Process *) (t struct nile_Thread *) (heap struct nile_Block *))
   (if (= 0 (cast (. (indir p) body) long))
@@ -263,9 +266,16 @@
 	(nile_Thread_poke (nile_Thread_liaison t)))
       (if (or (>= (nile_Process_input_n p) INPUT_QUOTA)
 	      (= 0 (nile_Process_block_on_producer p (cast 0 struct nile_Process * *))))
-	  (let ()
-	    (nile_Process_set_state p NILE_NOT_BLOCKED)
-	    (nile_Thread_append_to_q t (cast p struct nile_Node *)))))
+	  (let (((claimed int) 0))
+	    (nile_lock (. (indir p) lock))
+	    (if (!= NILE_NOT_BLOCKED (. (indir p) state))
+		(let ()
+		  (set (. (indir p) state) NILE_NOT_BLOCKED)
+		  (set claimed 1)))
+	    (nile_unlock (. (indir p) lock))
+	    (if nile_trace (dprintf 2 "# schedule %lx on thread %lx claimed %d\n" (cast p long) (cast t long) claimed))
+	    (if claimed
+		(nile_Thread_append_to_q t (cast p struct nile_Node *))))))
   (return heap))
 
 ;; Schedules p on t's private heap.
@@ -276,6 +286,7 @@
 ;; joined to its consumer, and its block goes back to the heap.
 (define-function nile_Process_remove (struct nile_Block *)
   ((p struct nile_Process *) (t struct nile_Thread *) (heap struct nile_Block *))
+  (if nile_trace (dprintf 2 "# remove %lx\n" (cast p long)))
   (let (((producer struct nile_Process *) (cast 0 struct nile_Process *))
 	((pstate int) -1)
 	((consumer struct nile_Process *) (nile_Process_consumer_of p))
@@ -426,8 +437,11 @@
 	((t struct nile_Thread *) (nile_Process_deactivate p))
 	((cstate int) 0))
     (if (= 0 (cast c long))
-	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on
-	(nile_Process_schedule_on p t)
+	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on (marked
+	;; blocked first, as a process is when scheduled, so the scheduler's claim takes it)
+	(let ()
+	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+	  (nile_Process_schedule_on p t))
 	(let ()
 	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
 	  (set cstate (nile_Process_state_of c))

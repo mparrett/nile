@@ -685,10 +685,13 @@
 ;; sibling's is cleared. All of it is one decision under the shared lock, which nothing takes while
 ;; holding a process lock: when both zippers stopped at once, each read its own consumer and cleared
 ;; the other's in separate sections, and both could end with none, the consumer waiting on a zipper
-;; that no longer fed it (nile_Process_handle_backpressure reschedules the one left without one).
+;; that no longer fed it (nile_Process_handle_backpressure reschedules the one left without one). A
+;; sibling already blocked on the consumer this takes waits on nothing now (only its consumer would have woken
+;; it, and that consumer's producer is this zipper), so it is scheduled.
 (define-function nile_Zip_claim void ((p nile_Process_t *) (v struct nile_Zip_vars *))
   (let (((shared struct nile_Process *) (. (indir v) shared))
 	((sib struct nile_Process *) (. (indir v) sibling))
+	((orphaned int) 0)
 	((c struct nile_Process *) (cast 0 struct nile_Process *)))
     (nile_lock (. (indir shared) lock))
     (nile_lock (. (indir p) lock))
@@ -697,6 +700,8 @@
     (nile_lock (. (indir sib) lock))
     (if (= 0 (cast c long))
 	(set c (. (indir sib) consumer)))
+    (set orphaned (and (!= 0 (cast (. (indir sib) consumer) long))
+		       (= NILE_BLOCKED_ON_CONSUMER (. (indir sib) state))))
     (set (. (indir sib) consumer) (cast 0 struct nile_Process *))
     (nile_unlock (. (indir sib) lock))
     (nile_lock (. (indir p) lock))
@@ -707,7 +712,9 @@
 	  (nile_lock (. (indir c) lock))
 	  (set (. (indir c) producer) p)
 	  (nile_unlock (. (indir c) lock))))
-    (nile_unlock (. (indir shared) lock))))
+    (nile_unlock (. (indir shared) lock))
+    (if orphaned
+	(nile_Process_schedule_on sib (. (indir p) thread)))))
 
 (define-function nile_Zip_body int
   ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
@@ -862,5 +869,27 @@
 	  (set (. (indir v) p2q) p2_out_quantum)))
     (return p)))
 
+;; Every block still holding a process (a freed one's type is overwritten by the heap's link), to stderr: what a test prints
+;; when a sync left blocks behind. The built-ins are named.
+(define-function nile_print_live void ()
+  (let (((b long) nile_blocks_from))
+    (while (< (+ b BLOCK_BYTES) nile_blocks_to)
+      (let (((p struct nile_Process *) (cast b struct nile_Process *)))
+	(if (= NILE_PROCESS_TYPE (. (indir p) type))
+	    (let (((f long) (cast (. (indir p) body) long)))
+	      (dprintf 2 "# live %lx %s state %d input %d producer %lx consumer %lx epilogue %d\n" b
+		       (cond ((= f (cast nile_Zip_body long)) "zip")
+			     ((= f (cast nile_Dup_body long)) "dup")
+			     ((= f (cast nile_Capture_body long)) "capture")
+			     ((= f (cast nile_Funnel_body long)) "funnel")
+			     ((= f (cast nile_Process_default_body long)) "pass")
+			     ((= f 0) "none")
+			     (else "kernel"))
+		       (. (indir p) state) (. (indir (. (indir p) input)) n)
+		       (cast (. (indir p) producer) long) (cast (. (indir p) consumer) long)
+		       (!= 0 (cast (. (indir p) epilogue) long))))))
+      (set b (+ b BLOCK_BYTES)))))
+
+(export nile_print_live)
 (export nile_PassThrough nile_Capture nile_Funnel nile_Funnel_pour nile_Reverse nile_SortBy nile_DupCat nile_DupZip)
 

@@ -54,6 +54,9 @@
 (define (nile_trace_on (void void) *)
   (extern nile_trace_on))
 
+(define (nile_print_live (void void) *)
+  (extern nile_print_live))
+
 (define (nile_print_leaks (void nile_Process_t *) *)
   (extern nile_print_leaks))
 

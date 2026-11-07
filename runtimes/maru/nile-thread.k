@@ -247,6 +247,8 @@
 	((p struct nile_Process *) (cast nd struct nile_Process *)))
     (if (or (!= NILE_PROCESS_TYPE (. (indir p) type)) (!= 0 (cast (. (indir p) thread) long)))
 	(let ()
+	  (dprintf 2 "# requeued %lx type %d thread %lx state %d\n" (cast p long) (. (indir p) type)
+		   (cast (. (indir p) thread) long) (. (indir p) state))
 	  (nile_lock (. (indir t) lock))
 	  (set (. (indir t) requeued) (+ (. (indir t) requeued) 1))
 	  (nile_unlock (. (indir t) lock))))
@@ -379,6 +381,8 @@
 			  (cast (nile_offset (+ start off_os) (cast (sizeof struct nile_OSThread) long) i)
 				struct nile_OSThread *))
 	(set i (+ i 1)))
+      (set nile_blocks_from blocks_at)
+      (set nile_blocks_to end)
       (nile_Process_setup root root 1 1 0 (cast 0 nile_Process_work_function_t)
 			  (cast 0 nile_Process_work_function_t) (cast 0 nile_Process_work_function_t))
       (set i 0)
@@ -536,6 +540,9 @@
 
 ;; The last funnel poured (nile_Funnel_pour), so a test's dump can walk its pipeline.
 (define (nile_last_funnel struct nile_Process *))
+;; The blocks nile_startup carved, first and past the last, so a test can list the processes still alive.
+(define (nile_blocks_from long))
+(define (nile_blocks_to long))
 
 ;; The liaison's counts and every thread's queue, to stderr: what a test prints when a schedule went wrong.
 (define-function nile_print_threads void ((t struct nile_Thread *))
