@@ -409,10 +409,13 @@
 	  (nile_Dup_push p p2 b2)))
     (nile_lock (. (indir p1) lock))
     (set (. (indir p1) producer) (cast 0 struct nile_Process *))
-    (set st (. (indir p1) state))
+    (if (= NILE_BLOCKED_ON_PRODUCER (. (indir p1) state))	; claimed in the section that releases it
+	(set st (nile_Process_claim_locked p1 (cast 0 struct nile_Process *))))
     (nile_unlock (. (indir p1) lock))
-    (if (= st NILE_BLOCKED_ON_PRODUCER)
-	(nile_Process_schedule_on p1 t))
+    (if (= st 1)
+	(nile_Thread_append_to_q t (cast p1 struct nile_Node *)))
+    (if (= st 2)
+	(set (. (indir t) private_heap) (nile_Process_remove p1 t (. (indir t) private_heap))))
     (nile_Process_join p p2)
     (return NILE_STATUS_OK)))
 

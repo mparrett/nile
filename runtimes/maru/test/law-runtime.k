@@ -10,6 +10,8 @@
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
 ;;       (key, payload) with field 0 the key); the built-ins run over quantum 1 (sort: 2) and print the
 ;;       output floats, one integer per line, as the runtime's Capture gives them.
+;;   reroute: the integers in are floats that pass through a kernel until it reads argv[3], when it reroutes to a
+;;       sub-pipeline that negates the rest (reroute-kernels.k), printed one integer per line.
 ;;   words, breaks, points: the integers in are glyph pairs (width, style) of text-layout.nl's Glyph; words
 ;;       prints MakeWords' Word triples (width, style, glyphs), breaks InsertLineBreaks' output of them, and
 ;;       points LayoutText's points (x, y), each as integers, one per line.
@@ -57,6 +59,8 @@
 	(set p (nile_Process_pipe (nile_DupZip init 1 (nile_Process_pipe (nile_PassThrough init 1) (nile_PassThrough init 1)) 1 (nile_PassThrough init 1) 1) p)))
     (if (= 0 (strcmp mode "points"))
 	(set p (nile_Process_pipe (text_layout_LayoutText init 0.0 0.0 (cast w float) 1.0) p)))
+    (if (= 0 (strcmp mode "reroute"))	; passes its input until it reads w, then reroutes to a sub-pipeline that negates
+	(set p (nile_Process_pipe (test_PassUntil init (test_Negate init) w) p)))
     (if (= 0 (strcmp mode "breaks"))
 	(set p (nile_Process_pipe (text_layout_InsertLineBreaks init (cast w float)) p)))
     (if (or (= 0 (strcmp mode "breaks")) (= 0 (strcmp mode "words")))
@@ -75,6 +79,7 @@
     (if (= 0 (strcmp mode "words")) (set known 1))
     (if (= 0 (strcmp mode "breaks")) (set known 1))
     (if (= 0 (strcmp mode "points")) (set known 1))
+    (if (= 0 (strcmp mode "reroute")) (set known 1))
     (return known)))
 
 ;; a missing or unknown mode, or a worker count outside 1 to MAX_THREADS, exits 2; memory that can't be had, 1.  Through exit:

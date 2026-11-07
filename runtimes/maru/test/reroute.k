@@ -15,60 +15,12 @@
 (define (SPLIT int) 500)
 (define (NBYTES_PER_THREAD int) 1000000)
 
-;; The variables: the sub-pipeline the kernel reroutes to, built with the pipeline.
-(define-struct test_Reroute_vars
-  ((sub struct nile_Process *)))
-
-(define-function test_PassUntil_body int
-  ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
-  (let (((v struct test_Reroute_vars *) (nile_Process_memory p))
-	((status int) 0))
-    (while (= status 0)
-      (while (< i m)
-	(if (= (cast (indir in i) int) SPLIT)
-	    (return (nile_Process_reroute p i j (. (indir v) sub))))
-	(if (= j n)
-	    (nile_Process_advance_output p (addressof out) (addressof j) (addressof n)))
-	(set (indir out j) (indir in i))
-	(set j (+ j 1))
-	(set i (+ i 1)))
-      (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m))))
-    (return (nile_Process_return p i j status))))
-
-(define-function test_PassUntil (nile_Process_t *)
-  ((parent nile_Process_t *) (sub nile_Process_t *))
-  (let ((p (nile_Process parent 1 1 (sizeof struct test_Reroute_vars)
-			 (cast 0 nile_Process_work_function_t) test_PassUntil_body
-			 (cast 0 nile_Process_work_function_t))))
-    (if (!= 0 (cast p long))
-	(let (((v struct test_Reroute_vars *) (nile_Process_memory p)))
-	  (set (. (indir v) sub) sub)))
-    (return p)))
-
-;; Negates each float it reads.
-(define-function test_Negate_body int
-  ((p nile_Process_t *) (in float *) (i int) (m int) (out float *) (j int) (n int))
-  (let ((status 0))
-    (while (= status 0)
-      (while (< i m)
-	(if (= j n)
-	    (nile_Process_advance_output p (addressof out) (addressof j) (addressof n)))
-	(set (indir out j) (- (cast 0.0 float) (indir in i)))
-	(set j (+ j 1))
-	(set i (+ i 1)))
-      (set status (nile_Process_advance_input p (addressof in) (addressof i) (addressof m))))
-    (return (nile_Process_return p i j status))))
-
-(define-function test_Negate (nile_Process_t *) ((parent nile_Process_t *))
-  (return (nile_Process parent 1 1 0 (cast 0 nile_Process_work_function_t) test_Negate_body
-			(cast 0 nile_Process_work_function_t))))
-
 ;; Funnel into the kernel into a Capture of NREALS floats; the sub-pipeline is built first.
 (define-function build_pipeline (nile_Process_t *)
   ((init nile_Process_t *) (out float *) (count int *))
   (let* (((sub nile_Process_t *) (test_Negate init))
 	 ((p nile_Process_t *) (nile_Capture init out count NREALS)))
-    (set p (nile_Process_pipe (test_PassUntil init sub) p))
+    (set p (nile_Process_pipe (test_PassUntil init sub SPLIT) p))
     (return (nile_Process_pipe (nile_Funnel init) p))))
 
 (define-function fill_counting void ((data float *) (n int))
