@@ -41,7 +41,10 @@
    (waiting      int)
    (status       int)
    (handed       int)     ; 1 when the running process rerouted itself: its work function stops there
-   (stopped      int)))   ; 1 when the running process stopped for its consumer's quota, until after_work reads it
+   (stopped      int)     ; 1 when the running process stopped for its consumer's quota, until after_work reads it
+   (dropped      int)     ; buffers with data in them freed by processes on this thread that had no consumer
+   (requeued     int)     ; processes this thread queued while they ran, or after they were freed
+   (reading      struct nile_Buffer *)))   ; the input buffer the running kernel reads, 0 for none
 
 ;; A process record. Its lock and input deque sit in the block after the record,
 ;; and the variable record after those; see nile_Process_memory in nile-kernel.k.
@@ -124,6 +127,9 @@
   (set (. (indir t) waiting) 0)
   (set (. (indir t) handed) 0)
   (set (. (indir t) stopped) 0)
+  (set (. (indir t) dropped) 0)
+  (set (. (indir t) requeued) 0)
+  (set (. (indir t) reading) (cast 0 struct nile_Buffer *))
   (set (. (indir t) status) NILE_STATUS_OK))
 
 ;; The thread's status, read under its lock.
@@ -234,9 +240,16 @@
       (set i (+ i 1)))))
 
 ;; Queues nd on t, counting it live on the liaison first, so the count never
-;; reads zero while work is on its way; then wakes t, or another waiting worker.
+;; reads zero while work is on its way; then wakes t, or another waiting worker. A process queued while it
+;; runs (it holds a thread) or after it was freed (its block's type is gone) is counted (nile_requeued).
 (define-function nile_Thread_append_to_q void ((t struct nile_Thread *) (nd struct nile_Node *))
-  (let (((l struct nile_Thread *) (nile_Thread_liaison t)))
+  (let (((l struct nile_Thread *) (nile_Thread_liaison t))
+	((p struct nile_Process *) (cast nd struct nile_Process *)))
+    (if (or (!= NILE_PROCESS_TYPE (. (indir p) type)) (!= 0 (cast (. (indir p) thread) long)))
+	(let ()
+	  (nile_lock (. (indir t) lock))
+	  (set (. (indir t) requeued) (+ (. (indir t) requeued) 1))
+	  (nile_unlock (. (indir t) lock))))
     (nile_lock (. (indir l) lock))
     (set (. (indir l) nlive) (+ (. (indir l) nlive) 1))
     (nile_unlock (. (indir l) lock)))
@@ -311,6 +324,7 @@
 (define-function nile_Thread_main (void *) ((arg void *))
   (let (((t struct nile_Thread *) (cast arg struct nile_Thread *))
 	((nd struct nile_Node *) (cast 0 struct nile_Node *)))
+    (nile_sched_enter (. (indir t) index))
     (while (!= NILE_STATUS_SHUTTING_DOWN (nile_Thread_status_of t))
       (set nd (nile_Thread_pop_own t))
       (if (= 0 (cast nd long))
@@ -318,6 +332,7 @@
       (if (= 0 (cast nd long))
 	  (nile_Thread_idle t)
 	  (nile_Thread_work t nd)))
+    (nile_sched_leave)
     (return (cast 0 void *))))
 
 ;; ---------------------------------------------------------------- runtime calls
@@ -378,9 +393,13 @@
 	(set (. (indir (nile_Thread_at threads i)) nblocks) nblocks)
 	(set i (+ i 1)))
       (nile_Process_activate root (nile_Thread_at threads nthreads))
+      (nile_sched_slot nthreads 1)
+      (set nile_sched_dump nile_print_threads_of)
+      (set nile_sched_dump_arg (cast (nile_Thread_at threads nthreads) void *))
       (set i 0)
       (while (< i nthreads)
 	(let (((t struct nile_Thread *) (nile_Thread_at threads i)))
+	  (nile_sched_slot i 0)
 	  (pthread_create (. (indir t) osthread) (cast 0 void *)
 			  (cast nile_Thread_main void *) (cast t void *)))
 	(set i (+ i 1)))
@@ -409,7 +428,8 @@
 	  (let ()
 	    (nile_lock (. (indir t) lock))
 	    (if (or (!= NILE_STATUS_OK (. (indir t) status))
-		    (and (= 0 (. (indir t) nlive)) (= 0 (. (indir t) ngated))))
+		    (and (= 0 (. (indir t) nlive)) (= 0 (. (indir t) ngated)))
+		    (< 0 (nile_deadlocks)))		; a schedule that deadlocked (a test's): nothing will run
 		(set done 1)
 		(let ()
 		  (set (. (indir t) waiting) 1)
@@ -424,6 +444,7 @@
   (let* (((t struct nile_Thread *) (nile_Process_deactivate p))
 	 ((n int) (. (indir t) nthreads))
 	 (i 0))
+    (nile_unschedule)
     (while (<= i n)
       (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
 	(nile_lock (. (indir o) lock))
@@ -468,4 +489,83 @@
 
 ;; The public calls are external symbols, so a kernel or driver reaches them through
 ;; nile.k's externs (dlsym) and not only through this file's own references.
-(export nile_startup nile_shutdown nile_sync nile_status nile_error nile_print_leaks)
+;; The buffers with data in them that processes with no consumer have freed, on every thread. A pipeline's
+;; last kernel may make output nobody reads, as in C, but one that ends in a Capture, which makes none, drops
+;; nothing: anything here is output lost on the way, which sync would otherwise report as success.
+(define-function nile_dropped int ((p struct nile_Process *))
+  (let* (((t struct nile_Thread *) (nile_Process_thread p))
+	 ((n int) 0)
+	 (i 0))
+    (while (<= i (. (indir t) nthreads))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(nile_lock (. (indir o) lock))
+	(set n (+ n (. (indir o) dropped)))
+	(nile_unlock (. (indir o) lock)))
+      (set i (+ i 1)))
+    (return n)))
+
+;; The processes queued while they ran or after they were freed (nile_Thread_append_to_q), on every thread.
+(define-function nile_requeued int ((p struct nile_Process *))
+  (let* (((t struct nile_Thread *) (nile_Process_thread p))
+	 ((n int) 0)
+	 (i 0))
+    (while (<= i (. (indir t) nthreads))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(nile_lock (. (indir o) lock))
+	(set n (+ n (. (indir o) requeued)))
+	(nile_unlock (. (indir o) lock)))
+      (set i (+ i 1)))
+    (return n)))
+
+;; The blocks not back in a heap, as nile_print_leaks counts them: after a sync with nothing held for a later
+;; pour, a process left blocked still has its block, so this is what a stranded pipeline leaves.
+(define-function nile_unreturned int ((p struct nile_Process *))
+  (let* (((t struct nile_Thread *) (nile_Process_deactivate p))
+	((nblocks int) (. (indir t) nblocks))
+	((n int) 0)
+	(i 0))
+    (while (<= i (. (indir t) nthreads))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(nile_lock (. (indir o) lock))
+	(set n (+ n (nile_Heap_size (. (indir o) private_heap))))
+	(set n (+ n (nile_Heap_size (. (indir o) public_heap))))
+	(nile_unlock (. (indir o) lock)))
+      (set i (+ i 1)))
+    (nile_Process_activate p t)
+    (return (- nblocks n))))
+
+;; The last funnel poured (nile_Funnel_pour), so a test's dump can walk its pipeline.
+(define (nile_last_funnel struct nile_Process *))
+
+;; The liaison's counts and every thread's queue, to stderr: what a test prints when a schedule went wrong.
+(define-function nile_print_threads void ((t struct nile_Thread *))
+  (let ((i 0)
+	((p struct nile_Process *) nile_last_funnel)
+	((k int) 0))
+    (while (and (!= 0 (cast p long)) (< k 12))
+      (dprintf 2 "# process %lx state %d input %d producer %lx consumer %lx thread %lx\n" (cast p long) (. (indir p) state)
+	       (. (indir (. (indir p) input)) n) (cast (. (indir p) producer) long) (cast (. (indir p) consumer) long)
+	       (cast (. (indir p) thread) long))
+      (set p (. (indir p) consumer))
+      (set k (+ k 1)))
+    (dprintf 2 "# nlive %d ngated %d status %d tick %d\n" (. (indir t) nlive) (. (indir t) ngated) (. (indir t) status) (. (indir t) ntick))
+    (while (<= i (. (indir t) nthreads))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(dprintf 2 "# thread %d: queued %d waiting %d wake %lx\n" i (. (indir (. (indir o) q)) n) (. (indir o) waiting) (cast (. (indir o) wake) long)))
+      (set i (+ i 1)))))
+
+(define-function nile_print_threads_of void ((arg void *))
+  (nile_print_threads (cast arg struct nile_Thread *)))
+
+(define-function nile_print_state void ((p struct nile_Process *))
+  (let* (((t struct nile_Thread *) (nile_Process_thread p))
+	 (i 0))
+    (dprintf 2 "# nlive %d ngated %d status %d\n" (. (indir t) nlive) (. (indir t) ngated) (. (indir t) status))
+    (while (<= i (. (indir t) nthreads))
+      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
+	(dprintf 2 "# thread %d: queued %d waiting %d\n" i (. (indir (. (indir o) q)) n) (. (indir o) waiting)))
+      (set i (+ i 1)))))
+
+(export nile_print_state)
+(export nile_startup nile_shutdown nile_sync nile_status nile_error nile_print_leaks nile_dropped nile_requeued
+	nile_unreturned nile_schedule nile_deadlocks nile_handoffs)

@@ -1,7 +1,10 @@
 ;; law-runtime.k -- one built-in or text-layout pipeline, run over integers read from stdin, for
 ;; check/laws/runtime.law (the laws run it through check/laws/runtime.l, one process per question).
 ;;
-;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default).
+;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default), and
+;; argv[4], when given, a schedule's seed: the threads take turns in the order it decides (nile_schedule), and a
+;; last line follows the output, "contracts D R U K": buffers dropped, processes queued while running or after
+;; being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its contracts.
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
 ;;       (key, payload) with field 0 the key); the built-ins run over quantum 1 (sort: 2) and print the
 ;;       output floats, one integer per line, as the runtime's Capture gives them.
@@ -12,6 +15,8 @@
 ;; worker count outside 1 to 64, exits 2.
 
 (define (printf (int char * ...) *) (extern printf))
+(define (getenv (char * char *) *) (extern getenv))
+(define (dprintf (int int char * ...) *) (extern dprintf))
 (define (scanf (int char * ...) *) (extern scanf))
 (define (malloc (void * long) *) (extern malloc))
 (define (free (void void *) *) (extern free))
@@ -90,6 +95,10 @@
     (if (or (< nthreads 1) (> nthreads MAX_THREADS) (= 0 (known_mode mode)))
 	(exit 2))
     (set nbytes (* NBYTES_PER_THREAD nthreads))
+    (if (> argc 4)
+	(nile_schedule (cast (atoi (indir argv 4)) long)))
+    (if (!= 0 (cast (getenv "NILE_TRACE") long))
+	(nile_trace_on))
     (set mem (malloc (cast nbytes long)))
     (if (or (= 0 (cast mem long)) (= 0 (cast data long)) (= 0 (cast out long)))
 	(exit 1))
@@ -105,6 +114,11 @@
 	(while (< k count)
 	  (printf "%d\n" (cast (indir out k) int))
 	  (set k (+ k 1))))
+    (if (> argc 4)
+	(let ()
+	  (printf "contracts %d %d %d %d\n" (nile_dropped init) (nile_requeued init) (nile_unreturned init) (nile_deadlocks))
+	  (dprintf 2 "handoffs %d\n" (nile_handoffs))
+	  (if (< 0 (nile_deadlocks)) (nile_print_state init))))
     (free (nile_shutdown init))
     (free data)
     (free out)

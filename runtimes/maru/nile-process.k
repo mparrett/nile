@@ -325,9 +325,20 @@
 	      (set heap (nile_Process_schedule producer t heap)))))
     (return heap)))
 
-;; Hands a buffer to p's consumer's input, or frees it when it is empty or p has no consumer.
+;; Set by a test to have every hand-off reported on stderr (nile_trace_on).
+(define (nile_trace int))
+
+;; Hands a buffer to p's consumer's input, or frees it when it is empty or p has no consumer; one
+;; with data in it that has nowhere to go is counted on p's thread (nile_dropped).
 (define-function nile_Process_enqueue_output void ((p struct nile_Process *) (b struct nile_Buffer *))
   (let (((c struct nile_Process *) (nile_Process_consumer_of p)))
+    (if nile_trace
+	(dprintf 2 "# hand %lx -> %lx: %d floats\n" (cast p long) (cast c long) (- (. (indir b) tail) (. (indir b) head))))
+    (if (and (= 0 (cast c long)) (!= (. (indir b) head) (. (indir b) tail)))
+	(let (((t struct nile_Thread *) (. (indir p) thread)))
+	  (nile_lock (. (indir t) lock))
+	  (set (. (indir t) dropped) (+ (. (indir t) dropped) 1))
+	  (nile_unlock (. (indir t) lock))))
     (if (or (= 0 (cast c long)) (= (. (indir b) head) (. (indir b) tail)))
 	(nile_Process_free_node p (cast b struct nile_Node *))
 	(let ()
@@ -414,10 +425,14 @@
   (let (((c struct nile_Process *) (nile_Process_consumer_of p))
 	((t struct nile_Thread *) (nile_Process_deactivate p))
 	((cstate int) 0))
-    (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
-    (set cstate (nile_Process_state_of c))
-    (if (= cstate NILE_BLOCKED_ON_PRODUCER)
-	(nile_Process_schedule_on c t))))
+    (if (= 0 (cast c long))
+	;; its consumer went to a sibling (Zip) while it stopped: nothing will wake it, so it runs on
+	(nile_Process_schedule_on p t)
+	(let ()
+	  (nile_Process_set_state p NILE_BLOCKED_ON_CONSUMER)
+	  (set cstate (nile_Process_state_of c))
+	  (if (= cstate NILE_BLOCKED_ON_PRODUCER)
+	      (nile_Process_schedule_on c t))))))
 
 ;; The process has no input left: it waits on its producer, or runs its epilogue
 ;; and is removed, or is removed when it has no producer. The producer is the one block_on_producer
@@ -445,6 +460,7 @@
 	(let ()
 	  (set (. (indir p) out) out)
 	  (set (. (indir t) handed) 0)
+	  (set (. (indir t) reading) (cast 0 struct nile_Buffer *))
 	  ((. (indir p) epilogue) p (cast 0 float *) 0 0
 	   (nile_Buffer_data out) (. (indir out) tail) (nile_Process_limit p))
 	  (if (= 0 (. (indir t) handed))
@@ -515,6 +531,7 @@
 	  (set m (. (indir head) tail))))
     (set (. (indir t) handed) 0)
     (set (. (indir t) stopped) 0)
+    (set (. (indir t) reading) head)
     (if (!= 0 (cast (. (indir p) prologue) long))
 	(let ()
 	  ((. (indir p) prologue) p (cast 0 float *) 0 0
@@ -547,4 +564,8 @@
 	  (nile_Process_work p t)))))
 
 ;; The public pipe, gate and feed calls, which kernels and drivers reach through dlsym.
-(export nile_Process_pipe nile_Process_pipeline nile_Process_feed nile_Process_gate nile_Process_launch)
+;; Turns the hand-off trace on, for a test.
+(define-function nile_trace_on void ()
+  (set nile_trace 1))
+
+(export nile_Process_pipe nile_Process_pipeline nile_Process_feed nile_Process_gate nile_Process_launch nile_trace_on)

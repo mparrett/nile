@@ -55,16 +55,20 @@
 ;; Moves the input to the next buffer, first handing back the used one. Returns 1
 ;; to stop the kernel: on an error or quota, with the used buffer kept so that
 ;; return can save the kernel's position in it; or when the input is used up.
+;; The used one is the buffer the kernel was reading, which its thread keeps (reading), not whatever heads
+;; the input now: with the input used up, a producer may hand a buffer in at any time, and marking that one
+;; used, or saving the old buffer's position in it, skipped its floats and sync reported success anyway.
 (define-function nile_Process_advance_input int
   ((p struct nile_Process *) (in float * *) (i int *) (m int *))
   (if (!= 0 (nile_Process_stop_wanted p))
       (return 1))
-  ;; i == m: the head buffer is used up, so its head meets its tail before it is dropped.
-  (let (((h struct nile_Buffer *) (nile_Process_head p)))
+  ;; i == m: the buffer read is used up, so its head meets its tail before it is dropped.
+  (let (((h struct nile_Buffer *) (. (indir (. (indir p) thread)) reading)))
     (if (!= 0 (cast h long))
 	(set (. (indir h) head) (. (indir h) tail))))
   (nile_Process_drop_used p)
   (let (((b struct nile_Buffer *) (nile_Process_head p)))
+    (set (. (indir (. (indir p) thread)) reading) b)
     (if (= 0 (cast b long))
 	(let ()
 	  (nile_Process_set_state p NILE_NOT_BLOCKED)
@@ -109,11 +113,12 @@
 		(set (indir j) 0)
 		(set (indir n) (nile_Process_limit p))))))))
 
-;; The kernel's last call: saves its position in the input and output buffers
-;; and returns the thread's status, which the runtime acts on after the call.
+;; The kernel's last call: saves its position in the input buffer it reads (its thread's reading, not the
+;; input's head, which may be a buffer handed in since) and the output buffer, and returns the thread's
+;; status, which the runtime acts on after the call.
 (define-function nile_Process_return int
   ((p struct nile_Process *) (i int) (j int) (status int))
-  (let (((head struct nile_Buffer *) (nile_Process_head p)))
+  (let (((head struct nile_Buffer *) (. (indir (. (indir p) thread)) reading)))
     (if (!= 0 (cast head long))
 	(set (. (indir head) head) i))
     (if (!= 0 (cast (. (indir p) out) long))
@@ -139,6 +144,7 @@
 	  (nile_lock (. (indir p) lock))
 	  (nile_Deque_push_head (. (indir p) input) (cast b struct nile_Node *))
 	  (nile_unlock (. (indir p) lock))
+	  (set (. (indir (. (indir p) thread)) reading) b)
 	  (set (indir in) (nile_Buffer_data b))
 	  (set (indir i) (. (indir b) capacity))
 	  (set (indir m) (. (indir b) capacity))))))
@@ -147,7 +153,7 @@
 ;; pipeline sub between p and its consumer (nile_Process_swap). Returns the thread's status.
 (define-function nile_Process_reroute int
   ((p struct nile_Process *) (i int) (j int) (sub struct nile_Process *))
-  (let (((head struct nile_Buffer *) (nile_Process_head p)))
+  (let (((head struct nile_Buffer *) (. (indir (. (indir p) thread)) reading)))
     (if (!= 0 (cast head long))
 	(set (. (indir head) head) i))
     (if (!= 0 (cast (. (indir p) out) long))

@@ -6,7 +6,8 @@
 ;; Each round starts the runtime afresh, its workers starting while the pipeline runs, and shuts it down.
 ;; argv[1] is the worker count, argv[2] the rounds, argv[3] the glyphs (244 by default), from the
 ;; linear congruential sequence check/laws/runtime.l's rt_glyphs uses, seed 7, laid out in width 5.
-;; Prints "stress ok" or how many rounds differed; built with text-layout.nl's module.
+;; A round also fails if any buffer with data in it was dropped (nile_dropped), which shows where output
+;; was lost. Prints "stress ok" or how many rounds differed; built with text-layout.nl's module.
 
 (define (printf (int char * ...) *) (extern printf))
 (define (malloc (void * long) *) (extern malloc))
@@ -48,6 +49,8 @@
 	 ((out float *) (malloc (cast (* (* 2 n) 4) long)))
 	 ((count int) 0)
 	 ((bad int) 0)
+	 ((short int) 0)
+	 ((dropped int) 0)
 	 ((ok int) 0)
 	 (r 0)
 	 (k 0))
@@ -57,7 +60,11 @@
       (if (= 0 (cast init long))
 	  (return 1))
       (set count (layout_round init data n (if (= r 0) first out)))
-      (set ok (and (= count (* 2 n)) (= 0 (nile_error init))))
+      (if (!= count (* 2 n))
+	  (set short (+ short 1)))
+      (if (!= 0 (nile_dropped init))	; the pipeline ends in a Capture, so nothing is dropped
+	  (set dropped (+ dropped 1)))
+      (set ok (and (= count (* 2 n)) (= 0 (nile_error init)) (= 0 (nile_dropped init))))
       (set k 0)
       (while (and ok (> r 0) (< k (* 2 n)))
 	(if (!= (indir out k) (indir first k))
@@ -69,7 +76,7 @@
       (set r (+ r 1)))
     (if (= bad 0)
 	(printf "stress ok\n")
-	(printf "stress FAILED %d of %d rounds\n" bad rounds))
+	(printf "stress FAILED %d of %d rounds (%d short, %d dropping output)\n" bad rounds short dropped))
     (free mem)
     (free data)
     (free first)
