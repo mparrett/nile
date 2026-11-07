@@ -263,8 +263,8 @@
 	((ps int) -1))
     (if (= NILE_NOT_BLOCKED (. (indir p) state))
 	(return 0))
-    (if (= 0 (cast (. (indir p) body) long))
-	(let ()
+    (if (= 0 (cast (. (indir p) body) long))	; rerouted (nile_Process_swap) and left waiting on its producer: whoever
+	(let ()				; wakes it is that producer, done with it, so it goes now
 	  (set (. (indir p) state) NILE_NOT_BLOCKED)
 	  (return 2)))
     (if (or (>= (. (indir (. (indir p) input)) n) INPUT_QUOTA) (= 0 (cast pr long)))
@@ -562,11 +562,28 @@
 	  (if (!= 0 (cast c long))
 	      (nile_Process_join (nile_Process_chain_end sub) c))
 	  (nile_Process_join p sub)))
-    (nile_lock (. (indir p) lock))
-    (set (. (indir p) body) (cast 0 nile_Process_work_function_t))
-    (nile_unlock (. (indir p) lock))
-    (if (= 0 (nile_Process_block_on_producer p (cast 0 struct nile_Process * *)))
-	(set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap))))
+    ;; the body cleared and the decision made in one section under p's lock (a waker's claim takes that lock): with no
+    ;; producer, or one blocked on p, p is claimed and removed here; otherwise it waits, and its producer's claim removes
+    ;; it (nile_Process_claim_locked). Decided in a later section, a waker that claimed p in between removed it too.
+    (let (((pr struct nile_Process *) (cast 0 struct nile_Process *))
+	  ((ps int) -1)
+	  ((mine int) 0))
+      (nile_lock (. (indir p) lock))
+      (set (. (indir p) body) (cast 0 nile_Process_work_function_t))
+      (set pr (. (indir p) producer))
+      (if (and (!= 0 (cast pr long)) (!= (cast pr long) (cast p long)))
+	  (let ()		; consumer before producer, the order locks nest in
+	    (nile_lock (. (indir pr) lock))
+	    (set ps (. (indir pr) state))
+	    (nile_unlock (. (indir pr) lock))))
+      (if (or (= 0 (cast pr long)) (= ps NILE_BLOCKED_ON_CONSUMER))
+	  (let ()
+	    (set (. (indir p) state) NILE_NOT_BLOCKED)
+	    (set mine 1))
+	  (set (. (indir p) state) NILE_BLOCKED_ON_PRODUCER))
+      (nile_unlock (. (indir p) lock))
+      (if mine
+	  (set (. (indir t) private_heap) (nile_Process_remove p t (. (indir t) private_heap)))))
     (return (nile_Thread_status_of t))))
 
 ;; After the kernel returns: an error ends the run; otherwise quota or running
