@@ -273,7 +273,6 @@
 		  (set (. (indir p) state) NILE_NOT_BLOCKED)
 		  (set claimed 1)))
 	    (nile_unlock (. (indir p) lock))
-	    (if nile_trace (dprintf 2 "# schedule %lx on thread %lx claimed %d\n" (cast p long) (cast t long) claimed))
 	    (if claimed
 		(nile_Thread_append_to_q t (cast p struct nile_Node *))))))
   (return heap))
@@ -286,7 +285,6 @@
 ;; joined to its consumer, and its block goes back to the heap.
 (define-function nile_Process_remove (struct nile_Block *)
   ((p struct nile_Process *) (t struct nile_Thread *) (heap struct nile_Block *))
-  (if nile_trace (dprintf 2 "# remove %lx\n" (cast p long)))
   (let (((producer struct nile_Process *) (cast 0 struct nile_Process *))
 	((pstate int) -1)
 	((consumer struct nile_Process *) (nile_Process_consumer_of p))
@@ -336,15 +334,10 @@
 	      (set heap (nile_Process_schedule producer t heap)))))
     (return heap)))
 
-;; Set by a test to have every hand-off reported on stderr (nile_trace_on).
-(define (nile_trace int))
-
 ;; Hands a buffer to p's consumer's input, or frees it when it is empty or p has no consumer; one
 ;; with data in it that has nowhere to go is counted on p's thread (nile_dropped).
 (define-function nile_Process_enqueue_output void ((p struct nile_Process *) (b struct nile_Buffer *))
   (let (((c struct nile_Process *) (nile_Process_consumer_of p)))
-    (if nile_trace
-	(dprintf 2 "# hand %lx -> %lx: %d floats\n" (cast p long) (cast c long) (- (. (indir b) tail) (. (indir b) head))))
     (if (and (= 0 (cast c long)) (!= (. (indir b) head) (. (indir b) tail)))
 	(let (((t struct nile_Thread *) (. (indir p) thread)))
 	  (nile_lock (. (indir t) lock))
@@ -580,8 +573,4 @@
 	  (nile_Process_work p t)))))
 
 ;; The public pipe, gate and feed calls, which kernels and drivers reach through dlsym.
-;; Turns the hand-off trace on, for a test.
-(define-function nile_trace_on void ()
-  (set nile_trace 1))
-
-(export nile_Process_pipe nile_Process_pipeline nile_Process_feed nile_Process_gate nile_Process_launch nile_trace_on)
+(export nile_Process_pipe nile_Process_pipeline nile_Process_feed nile_Process_gate nile_Process_launch)

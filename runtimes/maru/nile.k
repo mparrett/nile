@@ -46,21 +46,12 @@
 (define (nile_schedule_pct (void long * int long * int) *)
   (extern nile_schedule_pct))
 
-;; or by a plan of n preemptions, pairs (after, who)
-(define (nile_schedule_plan (void long * int) *)
-  (extern nile_schedule_plan))
-
 (define (nile_deadlocks (int void) *)
   (extern nile_deadlocks))
 
 (define (nile_handoffs (int void) *)
   (extern nile_handoffs))
 
-(define (nile_print_state (void nile_Process_t *) *)
-  (extern nile_print_state))
-
-(define (nile_trace_on (void void) *)
-  (extern nile_trace_on))
 
 (define (nile_print_live (void void) *)
   (extern nile_print_live))

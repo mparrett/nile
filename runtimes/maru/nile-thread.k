@@ -247,8 +247,6 @@
 	((p struct nile_Process *) (cast nd struct nile_Process *)))
     (if (or (!= NILE_PROCESS_TYPE (. (indir p) type)) (!= 0 (cast (. (indir p) thread) long)))
 	(let ()
-	  (dprintf 2 "# requeued %lx type %d thread %lx state %d\n" (cast p long) (. (indir p) type)
-		   (cast (. (indir p) thread) long) (. (indir p) state))
 	  (nile_lock (. (indir t) lock))
 	  (set (. (indir t) requeued) (+ (. (indir t) requeued) 1))
 	  (nile_unlock (. (indir t) lock))))
@@ -398,8 +396,6 @@
 	(set i (+ i 1)))
       (nile_Process_activate root (nile_Thread_at threads nthreads))
       (nile_sched_slot nthreads 1)
-      (set nile_sched_dump nile_print_threads_of)
-      (set nile_sched_dump_arg (cast (nile_Thread_at threads nthreads) void *))
       (set i 0)
       (while (< i nthreads)
 	(let (((t struct nile_Thread *) (nile_Thread_at threads i)))
@@ -538,41 +534,9 @@
     (nile_Process_activate p t)
     (return (- nblocks n))))
 
-;; The last funnel poured (nile_Funnel_pour), so a test's dump can walk its pipeline.
-(define (nile_last_funnel struct nile_Process *))
 ;; The blocks nile_startup carved, first and past the last, so a test can list the processes still alive.
 (define (nile_blocks_from long))
 (define (nile_blocks_to long))
 
-;; The liaison's counts and every thread's queue, to stderr: what a test prints when a schedule went wrong.
-(define-function nile_print_threads void ((t struct nile_Thread *))
-  (let ((i 0)
-	((p struct nile_Process *) nile_last_funnel)
-	((k int) 0))
-    (while (and (!= 0 (cast p long)) (< k 12))
-      (dprintf 2 "# process %lx state %d input %d producer %lx consumer %lx thread %lx\n" (cast p long) (. (indir p) state)
-	       (. (indir (. (indir p) input)) n) (cast (. (indir p) producer) long) (cast (. (indir p) consumer) long)
-	       (cast (. (indir p) thread) long))
-      (set p (. (indir p) consumer))
-      (set k (+ k 1)))
-    (dprintf 2 "# nlive %d ngated %d status %d tick %d\n" (. (indir t) nlive) (. (indir t) ngated) (. (indir t) status) (. (indir t) ntick))
-    (while (<= i (. (indir t) nthreads))
-      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
-	(dprintf 2 "# thread %d: queued %d waiting %d wake %lx\n" i (. (indir (. (indir o) q)) n) (. (indir o) waiting) (cast (. (indir o) wake) long)))
-      (set i (+ i 1)))))
-
-(define-function nile_print_threads_of void ((arg void *))
-  (nile_print_threads (cast arg struct nile_Thread *)))
-
-(define-function nile_print_state void ((p struct nile_Process *))
-  (let* (((t struct nile_Thread *) (nile_Process_thread p))
-	 (i 0))
-    (dprintf 2 "# nlive %d ngated %d status %d\n" (. (indir t) nlive) (. (indir t) ngated) (. (indir t) status))
-    (while (<= i (. (indir t) nthreads))
-      (let (((o struct nile_Thread *) (nile_Thread_at (. (indir t) threads) i)))
-	(dprintf 2 "# thread %d: queued %d waiting %d\n" i (. (indir (. (indir o) q)) n) (. (indir o) waiting)))
-      (set i (+ i 1)))))
-
-(export nile_print_state)
 (export nile_startup nile_shutdown nile_sync nile_status nile_error nile_print_leaks nile_dropped nile_requeued
-	nile_unreturned nile_schedule nile_schedule_plan nile_schedule_pct nile_deadlocks nile_handoffs)
+	nile_unreturned nile_schedule nile_schedule_pct nile_deadlocks nile_handoffs)

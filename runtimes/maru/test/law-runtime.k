@@ -3,10 +3,10 @@
 ;;
 ;; argv[1] is the worker count, argv[2] the mode, argv[3] the line width of the layout modes (10 by default), and
 ;; argv[4], when given, a schedule: a number is a seed, the threads taking turns in the order it decides (nile_schedule),
-;; "pct:P0,P1,.../C1,C2,..." a PCT schedule in full (nile_schedule_pct: slot priorities, then the turns where the running
-;; thread's drops), and "after:who,after:who,..." a plan of delays (nile_schedule_plan); either way a
-;; last line follows the output, "contracts D R U K": buffers dropped, processes queued while running or after
-;; being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its contracts.
+;; and "pct:P0,P1,.../C1,C2,..." a PCT schedule in full (nile_schedule_pct: slot priorities, then the turns where the running
+;; thread's drops). Either way a last line follows the output, "contracts D R U K": buffers dropped, processes queued while
+;; running or after being freed, blocks not returned after the sync, and deadlocks, each 0 for a runtime that keeps its
+;; contracts; a run that leaves blocks behind lists the processes still alive on stderr (nile_print_live).
 ;;   pass, reverse, sort, dupcat, dupzip: the integers in are one stream of floats (sort takes pairs
 ;;       (key, payload) with field 0 the key); the built-ins run over quantum 1 (sort: 2) and print the
 ;;       output floats, one integer per line, as the runtime's Capture gives them.
@@ -17,9 +17,7 @@
 ;; worker count outside 1 to 64, exits 2.
 
 (define (printf (int char * ...) *) (extern printf))
-(define (getenv (char * char *) *) (extern getenv))
 (define (strtol (long char * char * * int) *) (extern strtol))
-(define (strchr (char * char * int) *) (extern strchr))
 (define (dprintf (int int char * ...) *) (extern dprintf))
 (define (scanf (int char * ...) *) (extern scanf))
 (define (malloc (void * long) *) (extern malloc))
@@ -107,22 +105,6 @@
     (set nc (read_numbers rest changes 128 (addressof rest)))
     (nile_schedule_pct prios np changes nc)))
 
-;; reads "after:who,after:who,..." into pairs and takes turns by them
-(define-function schedule_plan void ((text char *))
-  (let (((plan long *) (cast (malloc 8192) long *))
-	((n int) 0)
-	((p char *) text)
-	((e char *) text))
-    (while (and (!= 0 (cast (indir p) int)) (< n 512))
-      (set (indir plan (* 2 n)) (strtol p (addressof e) 10))
-      (set p e)
-      (if (= 58 (cast (indir p) int)) (set p (+ p 1)))
-      (set (indir plan (+ 1 (* 2 n))) (strtol p (addressof e) 10))
-      (set p e)
-      (if (= 44 (cast (indir p) int)) (set p (+ p 1)))
-      (set n (+ n 1)))
-    (nile_schedule_plan plan n)))
-
 (define-function main int ((argc int) (argv char * *))
   (if (< argc 3)
       (exit 2))
@@ -144,11 +126,7 @@
     (if (> argc 4)
 	(if (= 112 (cast (indir (indir argv 4)) int))	; "pct:...": a PCT schedule in full
 	    (schedule_pct (+ (indir argv 4) 4))
-	    (if (!= 0 (cast (strchr (indir argv 4) 58) long))	; a ':': a plan
-		(schedule_plan (indir argv 4))
-		(nile_schedule (cast (atoi (indir argv 4)) long)))))
-    (if (!= 0 (cast (getenv "NILE_TRACE") long))
-	(nile_trace_on))
+	    (nile_schedule (cast (atoi (indir argv 4)) long))))
     (set mem (malloc (cast nbytes long)))
     (if (or (= 0 (cast mem long)) (= 0 (cast data long)) (= 0 (cast out long)))
 	(exit 1))
@@ -168,7 +146,6 @@
 	(let ()
 	  (printf "contracts %d %d %d %d\n" (nile_dropped init) (nile_requeued init) (nile_unreturned init) (nile_deadlocks))
 	  (dprintf 2 "handoffs %d turns %ld\n" (nile_handoffs) nile_sched_steps)
-	  (if (< 0 (nile_deadlocks)) (nile_print_state init))
 	  (if (< 0 (nile_unreturned init)) (nile_print_live))))
     (free (nile_shutdown init))
     (free data)

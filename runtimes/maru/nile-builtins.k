@@ -110,7 +110,6 @@
 	     ((v struct nile_Funnel_vars *) (nile_Process_memory p))
 	     ((c struct nile_Process *) (nile_Process_consumer_of p))
 	     ((go int) 1))
-	(set nile_last_funnel p)
 	(set (. (indir v) pos) 0)
 	(set (. (indir v) count) n)
 	(set (. (indir v) data) data)
