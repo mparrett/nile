@@ -47,11 +47,11 @@
 ;; the pipeline, and the kernels' push-back past their buffer's start then writes outside it.
 ;; One path through a pipeline ending in paint, a Texturer: placed by the matrix in params[0..5], clipped to width x height,
 ;; rasterized, textured and written into the image.
+;; Fills a path, its count whole path elements (six floats each), with paint.  The callers refuse any other count before
+;; they make paint, which would otherwise hold its blocks for good.
 (define-function gezira_fill_with int
   ((i nile_Process_t *) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
    (paint nile_Process_t *))
-  (if (!= 0 (% count 6))
-      (return NILE_STATUS_BAD_ARG))
   (let* (((out nile_Process_t *) (gezira_WriteToImage_ARGB32 i (cast pixels int *) width height width))
 	 ((head nile_Process_t *) 0))
     (set out (nile_Process_pipe (gezira_ApplyTexturer i paint) out))
@@ -65,9 +65,11 @@
     (nile_sync i)
     (return (nile_error i))))
 
-(define-function gezira_fill int
+(define-function gezira_fill int	; a count that isn't whole path elements is refused before the paint is made
   ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int))
   (let (((i nile_Process_t *) (cast init nile_Process_t *)))
+    (if (!= 0 (% count 6))
+	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
 			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6))))))
 
@@ -86,6 +88,8 @@
   ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
    (image long) (iw int) (ih int) (filter int))
   (let (((i nile_Process_t *) (cast init nile_Process_t *)))
+    (if (!= 0 (% count 6))
+	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
 			      (gezira_texture i (+ params 24) image iw ih filter)))))
 
