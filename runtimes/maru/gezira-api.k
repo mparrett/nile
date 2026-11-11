@@ -77,23 +77,20 @@
     (nile_sync i)
     (return (nile_error i))))
 
-(define-function gezira_fill int	; a count that isn't whole path elements is refused before the paint is made
-  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int))
-  (let (((i nile_Process_t *) (cast init nile_Process_t *)))
-    (if (!= 0 (% count 6))
-	(return NILE_STATUS_BAD_ARG))
-    (return (gezira_fill_with i pixels width height params floats count
-			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6)) (cast 0 float *) 0))))
-
-;; gezira_fill, clipped by nstages stages (gezira_fill_with)
+;; gezira_fill, clipped by nstages stages (gezira_fill_with).  A count that isn't whole path elements, or stages that
+;; aren't there, are refused before the paint is made.
 (define-function gezira_fill_clipped int
   ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int) (stages float *) (nstages int))
   (let (((i nile_Process_t *) (cast init nile_Process_t *)))
-    (if (or (!= 0 (% count 6)) (< nstages 0))
+    (if (or (!= 0 (% count 6)) (< nstages 0) (and (< 0 nstages) (= 0 (cast stages long))))
 	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
 			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6))
 			      stages nstages))))
+
+(define-function gezira_fill int
+  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int))
+  (return (gezira_fill_clipped init pixels width height params floats count (cast 0 float *) 0)))
 
 ;; An image's texture, as GeziraFillImage's pipelineOn:for: builds it: the points through t (a b c d e f), then read from
 ;; the image, through the bilinear filter unless filter is 0.
@@ -104,26 +101,21 @@
     (return (nile_Process_pipe (gezira_TransformPoints i (indir t 0) (indir t 1) (indir t 2) (indir t 3) (indir t 4) (indir t 5))
 			       read))))
 
-;; Fills one path with an image: params holds the path's matrix (0..5) and the texture's (6..11), which takes a pixel of
-;; the target to a point of the image, an iw x ih image of premultiplied ARGB32.
-(define-function gezira_fill_image int
-  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
-   (image long) (iw int) (ih int) (filter int))
-  (let (((i nile_Process_t *) (cast init nile_Process_t *)))
-    (if (!= 0 (% count 6))
-	(return NILE_STATUS_BAD_ARG))
-    (return (gezira_fill_with i pixels width height params floats count
-			      (gezira_texture i (+ params 24) image iw ih filter) (cast 0 float *) 0))))
-
-;; gezira_fill_image, clipped by nstages stages (gezira_fill_with)
+;; Fills one path with an image, clipped by nstages stages: params holds the path's matrix (0..5) and the texture's
+;; (6..11), which takes a pixel of the target to a point of the image, an iw x ih image of premultiplied ARGB32.
 (define-function gezira_fill_image_clipped int
   ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
    (image long) (iw int) (ih int) (filter int) (stages float *) (nstages int))
   (let (((i nile_Process_t *) (cast init nile_Process_t *)))
-    (if (or (!= 0 (% count 6)) (< nstages 0))
+    (if (or (!= 0 (% count 6)) (< nstages 0) (and (< 0 nstages) (= 0 (cast stages long))))
 	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
 			      (gezira_texture i (+ params 24) image iw ih filter) stages nstages))))
+
+(define-function gezira_fill_image int
+  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
+   (image long) (iw int) (ih int) (filter int))
+  (return (gezira_fill_image_clipped init pixels width height params floats count image iw ih filter (cast 0 float *) 0)))
 
 ;; GeziraBindings' downsample: an iw x ih image to a new one of (iw / 2) x (ih / 2), a rectangle of that size rasterized
 ;; and textured from the image scaled by the sizes' ratio through the bilinear filter; answers it (0 for one too small).
