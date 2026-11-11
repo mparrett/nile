@@ -45,18 +45,30 @@
 ;; image's size. Returns the runtime's error status (0 for none). A count that isn't a whole number of
 ;; elements is refused with BAD_ARG, as nile_Process_feed refuses it: the trailing floats would stay in
 ;; the pipeline, and the kernels' push-back past their buffer's start then writes outside it.
-;; One path through a pipeline ending in paint, a Texturer: placed by the matrix in params[0..5], clipped to width x height,
-;; rasterized, textured and written into the image.
+;; One path through a pipeline ending in paint, a Texturer: placed by the matrix in params[0..5], clipped by each of nstages
+;; stages, clipped to width x height, rasterized, textured and written into the image.  A stage is ten floats, a b c d e
+;; f then min x, min y, max x, max y: a clip rectangle in its own coordinates, and the matrix from those to the stage
+;; outside it (the image's for the first), outermost first.  The path's matrix takes it into the innermost stage's
+;; coordinates, so the pipeline runs as GeziraCanvas builds one for its clips interleaved with its transforms:
+;; TransformBeziers (params), ClipBeziers (innermost), TransformBeziers (its matrix) ... ClipBeziers (the image).
 ;; Fills a path, its count whole path elements (six floats each), with paint.  The callers refuse any other count before
 ;; they make paint, which would otherwise hold its blocks for good.
 (define-function gezira_fill_with int
   ((i nile_Process_t *) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
-   (paint nile_Process_t *))
+   (paint nile_Process_t *) (stages float *) (nstages int))
   (let* (((out nile_Process_t *) (gezira_WriteToImage_ARGB32 i (cast pixels int *) width height width))
-	 ((head nile_Process_t *) 0))
+	 ((head nile_Process_t *) 0)
+	 ((k int) 0)
+	 ((s float *) 0))
     (set out (nile_Process_pipe (gezira_ApplyTexturer i paint) out))
     (set out (nile_Process_pipe (gezira_Rasterize i) out))
     (set out (nile_Process_pipe (gezira_ClipBeziers i (cast 0.0 float) (cast 0.0 float) (cast width float) (cast height float)) out))
+    (while (< k nstages)
+      (set s (+ stages (* k 10)))
+      (set out (nile_Process_pipe (gezira_TransformBeziers i (indir s 0) (indir s 1) (indir s 2) (indir s 3) (indir s 4) (indir s 5))
+				  out))
+      (set out (nile_Process_pipe (gezira_ClipBeziers i (indir s 6) (indir s 7) (indir s 8) (indir s 9)) out))
+      (set k (+ k 1)))
     (set out (nile_Process_pipe (gezira_TransformBeziers i (indir params 0) (indir params 1) (indir params 2)
 							(indir params 3) (indir params 4) (indir params 5))
 				out))
@@ -71,7 +83,17 @@
     (if (!= 0 (% count 6))
 	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
-			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6))))))
+			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6)) (cast 0 float *) 0))))
+
+;; gezira_fill, clipped by nstages stages (gezira_fill_with)
+(define-function gezira_fill_clipped int
+  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int) (stages float *) (nstages int))
+  (let (((i nile_Process_t *) (cast init nile_Process_t *)))
+    (if (or (!= 0 (% count 6)) (< nstages 0))
+	(return NILE_STATUS_BAD_ARG))
+    (return (gezira_fill_with i pixels width height params floats count
+			      (gezira_UniformColor i (indir params 7) (indir params 8) (indir params 9) (indir params 6))
+			      stages nstages))))
 
 ;; An image's texture, as GeziraFillImage's pipelineOn:for: builds it: the points through t (a b c d e f), then read from
 ;; the image, through the bilinear filter unless filter is 0.
@@ -91,7 +113,17 @@
     (if (!= 0 (% count 6))
 	(return NILE_STATUS_BAD_ARG))
     (return (gezira_fill_with i pixels width height params floats count
-			      (gezira_texture i (+ params 24) image iw ih filter)))))
+			      (gezira_texture i (+ params 24) image iw ih filter) (cast 0 float *) 0))))
+
+;; gezira_fill_image, clipped by nstages stages (gezira_fill_with)
+(define-function gezira_fill_image_clipped int
+  ((init long) (pixels long) (width int) (height int) (params float *) (floats float *) (count int)
+   (image long) (iw int) (ih int) (filter int) (stages float *) (nstages int))
+  (let (((i nile_Process_t *) (cast init nile_Process_t *)))
+    (if (or (!= 0 (% count 6)) (< nstages 0))
+	(return NILE_STATUS_BAD_ARG))
+    (return (gezira_fill_with i pixels width height params floats count
+			      (gezira_texture i (+ params 24) image iw ih filter) stages nstages))))
 
 ;; GeziraBindings' downsample: an iw x ih image to a new one of (iw / 2) x (ih / 2), a rectangle of that size rasterized
 ;; and textured from the image scaled by the sizes' ratio through the bilinear filter; answers it (0 for one too small).
@@ -154,5 +186,7 @@
 (export gezira_pixel)
 (export gezira_fill)
 (export gezira_fill_image)
+(export gezira_fill_clipped)
+(export gezira_fill_image_clipped)
 (export gezira_downsample)
 (export gezira_premultiply)
